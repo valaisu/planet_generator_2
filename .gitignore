@@ -1,0 +1,28 @@
+# build output
+build/
+
+# generated images/animations (regenerate with tools/refresh_renders.sh)
+renders/
+*_frames/
+
+# python (uv)
+.venv/
+__pycache__/
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude instructions (kept local)
+CLAUDE.md
+**/CLAUDE.md
+
+# non-essential image/video data (source photos, stylized references, measuring-stick maps)
+earth_images/
+solar_system_reference/
+references/
+data/*.jpg
+*.gif
+*.mp4
