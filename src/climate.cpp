@@ -66,7 +66,30 @@ float saturation(float t) { return std::exp(0.064f * (t - 25.0f)); }
 
 }  // namespace
 
+// Worlds without a water cycle: annual-mean temperature from the physics'
+// latitude profile T = T_mean + dT (1/3 - sin^2 lat); no rain, no humidity.
+void dry_climate(Planet& P) {
+    const CubeGrid& g = P.grid;
+    const int F = g.size();
+    const WorldSpec& W = P.world;
+    const float dt = W.t_equator - W.t_pole, tm = W.t_equator - dt / 3.0f;
+    P.temperature.resize(F);
+    P.pressure.assign(F, 1013.0f);
+    P.wind.assign(F, Vec3(0, 0, 0));
+    P.precip.assign(F, 0.0f);
+    P.humidity.assign(F, 0.0f);
+    P.sst_anomaly.assign(F, 0.0f);
+    for (int c = 0; c < F; ++c) {
+        float s = g.dir(c).y;
+        P.temperature[c] = tm + dt * (1.0f / 3.0f - s * s);
+        // Locked: radiative-equilibrium-like falloff from the substellar point
+        // (lon 0, +z) to the night side.
+        if (W.locked) P.temperature[c] = W.t_pole + dt * std::pow(std::max(0.0f, g.dir(c).z), 0.25f);
+    }
+}
+
 void simulate_climate(Planet& P, const PlanetParams& /*prm*/) {
+    if (!P.world.ocean) { dry_climate(P); return; }
     const CubeGrid& fine = P.grid;
     const CubeGrid g(CLIMATE_N);
     const int N = g.size();
@@ -115,7 +138,7 @@ void simulate_climate(Planet& P, const PlanetParams& /*prm*/) {
         float a = std::fabs(lat_deg(g.dir(c)));
         float t = 27.0f - 47.0f * std::pow(a / 90.0f, 1.5f);
         t += cont[c] * (3.0f - 25.0f * std::pow(a / 90.0f, 1.5f));
-        t += anom[c];
+        t += anom[c] + P.world.t_offset;
         t_sea[c] = t;  // over the sea: the surface-air temperature (sea ice below ~-5)
         t_air[c] = t_sea[c] - 6.5f * elev[c] / 1000.0f;
     }

@@ -36,7 +36,7 @@ namespace {
 constexpr float ATMO_TOP = 0.06f;  // shell thickness
 constexpr float H_RAYLEIGH = 0.008f, H_MIE = 0.004f;
 const Vec3 BETA_R(5.8f, 13.5f, 33.1f);
-constexpr float BETA_M = 10.0f, MIE_G = 0.76f;
+constexpr float BETA_M = 10.0f;
 constexpr float SKY_INTENSITY = 10.0f;
 
 // Ray-sphere (origin-centred) entry/exit distances; false on a miss.
@@ -73,10 +73,12 @@ Vec3 vmul(Vec3 a, Vec3 b) { return Vec3(a.x * b.x, a.y * b.y, a.z * b.z); }
 }  // namespace
 
 Vec3 atmosphere(Vec3 o, Vec3 d, Vec3 base, float t_surface, Vec3 to_sun, Vec3 sun_color,
-                float scale, float haze) {
-    const Atmo A{1.0f + ATMO_TOP * scale, H_RAYLEIGH * scale, H_MIE * scale};
-    const Vec3 br = BETA_R / scale;
-    const float bm = BETA_M / scale;
+                float scale, float haze, const AtmoOptics& opt) {
+    if (!opt.enabled) return base;
+    const float hs = scale * opt.height;  // same vertical optical depth at any height
+    const Atmo A{1.0f + ATMO_TOP * hs, H_RAYLEIGH * hs, H_MIE * opt.mie_height * hs};
+    const Vec3 br = BETA_R * opt.rayleigh / hs;
+    const float bm = BETA_M * opt.mie / hs;
     float t0, t1;
     if (!sphere_span(o, d, A.top, t0, t1) || t1 <= 0.0f) return base;
     t0 = std::max(t0, 0.0f);
@@ -105,10 +107,10 @@ Vec3 atmosphere(Vec3 o, Vec3 d, Vec3 base, float t_surface, Vec3 to_sun, Vec3 su
     constexpr float PI = 3.14159265358979323846f;
     float mu = dot(d, to_sun);
     float phase_r = 3.0f / (16.0f * PI) * (1.0f + mu * mu);
-    float g2 = MIE_G * MIE_G;
+    const float G = opt.mie_g, g2 = G * G;
     float phase_m = 3.0f / (8.0f * PI) * ((1.0f - g2) * (1.0f + mu * mu))
-                    / ((2.0f + g2) * std::pow(1.0f + g2 - 2.0f * MIE_G * mu, 1.5f));
-    Vec3 inscatter = vmul(sun_color, vmul(br, sum_r) * phase_r + sum_m * (bm * phase_m)) * SKY_INTENSITY;
+                    / ((2.0f + g2) * std::pow(1.0f + g2 - 2.0f * G * mu, 1.5f));
+    Vec3 inscatter = vmul(sun_color, vmul(br, sum_r) * phase_r + vmul(sum_m, opt.mie_albedo) * (bm * phase_m)) * SKY_INTENSITY;
 
     Vec3 view_t = vexp((br * vr + Vec3(1, 1, 1) * (bm * 1.1f * vm)) * -1.0f);
     if (surface) {

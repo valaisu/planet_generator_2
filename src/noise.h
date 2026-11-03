@@ -58,6 +58,22 @@ inline float value_noise3(Vec3 p) {
     return y0 + (y1 - y0) * sz;
 }
 
+// fbm with every octave rotated (a fixed orthonormal matrix): the lattice planes
+// of successive octaves don't line up, so creases (1 - |2f - 1|), contours and
+// derivatives show no axis-aligned facets. Use for new features (fbm3 is kept
+// as is: changing it would change every existing planet).
+inline float fbm3r(Vec3 p, int octaves) {
+    float sum = 0.0f, amp = 0.5f, tot = 0.0f;
+    for (int i = 0; i < std::max(1, octaves); ++i) {
+        p = Vec3(0.80f * p.y + 0.60f * p.z, -0.80f * p.x + 0.36f * p.y - 0.48f * p.z, -0.60f * p.x - 0.48f * p.y + 0.64f * p.z);
+        sum += amp * value_noise3(p);
+        tot += amp;
+        p = p * 2.0f;
+        amp *= 0.5f;
+    }
+    return sum / tot;
+}
+
 // Layered fbm in [0,1].
 inline float fbm3(Vec3 p, int octaves) {
     float sum = 0.0f, amp = 0.5f, tot = 0.0f;

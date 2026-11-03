@@ -10,9 +10,6 @@ namespace {
 // the view's atmosphere so cloud tops sit above the same share of the air (the
 // exaggerated disk atmosphere otherwise tinted them cream).
 float cloud_h(const View& v) { return 0.6f * 0.008f * v.atmo_scale; }
-// Slightly blue: the view path's extinction yellows cloud tops otherwise (the
-// photos' clouds are white to bluish).
-const Vec3 CLOUD_ALBEDO(0.90f, 0.94f, 1.0f);
 
 float smooth01(float a, float b, float x) {
     float t = std::clamp((x - a) / (b - a), 0.0f, 1.0f);
@@ -41,8 +38,14 @@ Vec3 tangent_grad(Vec3 p, float h, float f0, F&& f) {
 
 // Lambert with an ambient floor; `geo` (geometric normal) gates the night side
 // so tilted relief normals can't light up past the terminator.
-Vec3 lit(Vec3 albedo, Vec3 n, Vec3 geo, const View& v, float shadow) {
-    float diffuse = std::max(0.0f, dot(n, v.to_sun)) * smooth01(-0.03f, 0.08f, dot(geo, v.to_sun));
+// `ls` blends in the Lommel-Seeliger law 2 mu0 / (mu0 + mu) (mu = cos of the view
+// angle, from `to_eye`): dusty regolith scatters mostly once, so a full-phase disk
+// stays flat to the limb (the full Moon), unlike a Lambert ball.
+Vec3 lit(Vec3 albedo, Vec3 n, Vec3 geo, const View& v, float shadow, float ls = 0.0f, Vec3 to_eye = Vec3(0, 0, 0)) {
+    float mu0 = std::max(0.0f, dot(n, v.to_sun));
+    float law = mu0;
+    if (ls > 0.0f) law += ls * (2.0f * mu0 / (mu0 + std::max(0.05f, dot(n, to_eye))) - mu0);
+    float diffuse = law * smooth01(-0.03f, 0.08f, dot(geo, v.to_sun));
     return vmul(albedo, Vec3(AMBIENT, AMBIENT, AMBIENT) + v.sun_color * ((1.0f - AMBIENT) * diffuse * shadow));
 }
 constexpr float RIVER_MIN = 8e3f;  // drainage (km^2 at 1000 mm/yr; ~250 m^3/s) for a visible river
@@ -103,8 +106,11 @@ float city_light(const Planet& P, Vec3 n, Vec3 off, const View& v) {
 }
 }  // namespace
 
-Shaded shade(const Scene& S, const View& v, const Ray& r) {
+Shaded shade(const Scene& S, const View& view, const Ray& r) {
     const Planet& P = S.planet;
+    const WorldSpec& W = P.world;
+    View v = view;
+    v.sun_color = vmul(v.sun_color, W.star_color) * W.exposure;
     const CubeGrid& g = P.grid;
     const Vec3 off(static_cast<float>(S.seed % 101) * 1.7f, 3.1f, static_cast<float>(S.seed % 37) * 0.9f);
     Vec3 o = r.origin, d = normalize(r.direction);
@@ -142,13 +148,15 @@ Shaded shade(const Scene& S, const View& v, const Ray& r) {
     };
 
     float g0, g1, c0, c1;
+    // A deck (Venus, Titan) tops out higher: scaled with the scale height.
+    const float top = cloud_h(v) * (W.deck ? W.optics.height : 1.0f);
     bool ground = sphere_span(o, d, 1.0f, g0, g1) && g0 > 0.0f;
-    bool shell = sphere_span(o, d, 1.0f + cloud_h(v), c0, c1) && c0 > 0.0f;
+    bool shell = sphere_span(o, d, 1.0f + top, c0, c1) && c0 > 0.0f;
 
-    // Ground (or stars).
-    Vec3 base;
+    // Ground (or stars); nothing under an opaque deck.
+    Vec3 base(0, 0, 0);
     Seen what = Seen::Space;
-    if (ground) {
+    if (ground && !W.deck) {
         Vec3 n = normalize(o + d * g0);
         float h = g.sample(P.elevation, n);
         const float relief_amp = 300.0f + 0.35f * std::fabs(h);  // rougher in high terrain
@@ -230,7 +238,20 @@ Shaded shade(const Scene& S, const View& v, const Ray& r) {
         float s0, s1, shadow = 1.0f;
         if (sphere_span(n, v.to_sun, 1.0f + cloud_h(v), s0, s1))
             shadow = 1.0f - 0.85f * cloud_alpha(normalize(n + v.to_sun * s1));
-        base = lit(albedo, normal, n, v, shadow);
+        if (land && W.relief_light > 0.0f) {
+            // Mosaic-style relief light: the relief's shading under a local sun
+            // relief_sun above the horizon, relative to flat ground. From the upper
+            // left of the screen, as on shaded-relief maps: lit from the right or
+            // below, craters read as domes.
+            Vec3 side = v.cam.up() - v.cam.right();
+            side = side - n * dot(side, n) + d * 1e-3f;  // (d: nonzero at the limb)
+            float el = W.relief_sun * 0.0174533f;
+            Vec3 L = normalize(normalize(side) * std::cos(el) + n * std::sin(el));
+            float k = 0.25f + 0.75f * std::max(0.0f, dot(normal, L)) / std::sin(el);  // soft: no black one-cell spikes
+            albedo = albedo * (1.0f + W.relief_light * (k - 1.0f));
+            normal = normalize(n + (normal - n) * (1.0f - W.relief_light));
+        }
+        base = lit(albedo, normal, n, v, shadow, W.lommel_seeliger, d * -1.0f);
         // City lights on the night side (under the cloud layer, so clouds dim them).
         float night = smooth01(0.02f, -0.12f, dot(n, v.to_sun));
         if (land && night > 0.0f) {
@@ -239,22 +260,39 @@ Shaded shade(const Scene& S, const View& v, const Ray& r) {
             base = base + (LIGHT_COLOR + (Vec3(1.0f, 0.95f, 0.8f) - LIGHT_COLOR) * smooth01(0.6f, 1.5f, L)) * L;
             if (L > 0.08f) what = Seen::Lights;
         }
-    } else {
+    } else if (!shell || !W.deck) {
         base = background(r, S.bg);
     }
 
-    // Cloud layer over it.
+    // Cloud layer over it. A deck is opaque everywhere; the simulated weather
+    // only shades it (thin -> deck_dark, thick -> deck_light).
     float alpha = 0.0f;
     if (shell) {
         Vec3 pc = normalize(o + d * c0);
         alpha = cloud_alpha(pc);
-        if (alpha > 0.0f) {
+        if (W.deck) {
+            // Broad soft swirls drawn out along latitude circles by the zonal
+            // wind (noise squashed 3x north-south, warped), ~10-20 px across as
+            // in the photos; the simulated weather only adds a little; seasons
+            // darken one hemisphere.
+            Vec3 zq(pc.x, pc.y * 3.0f, pc.z);
+            Vec3 wq = zq * 2.5f + Vec3(fbm3(zq * 2.0f + off, 3), fbm3(zq * 2.0f + off * 1.3f, 3), 0.0f) * 1.5f;
+            float swirl = fbm3(wq + off * 2.0f, 4);
+            float shade_w = std::clamp(0.5f + W.deck_texture * (2.4f * (swirl - 0.5f) + 0.25f * (alpha - 0.5f))
+                                       - W.deck_asym * pc.y, 0.0f, 1.0f);
+            Vec3 col = W.deck_dark + (W.deck_light - W.deck_dark) * shade_w;
+            base = lit(col, pc, pc, v, 1.0f);
+            alpha = 1.0f;
+            what = Seen::Cloud;
+        } else if (alpha > 0.0f) {
             Vec3 nc = pc;
             if (v.detail) {  // lumpy cloud tops catch the low sun
                 auto top = [&](Vec3 p) { return fbm3(p * 250.0f + off * 3.0f, 4); };
                 nc = normalize(pc - tangent_grad(pc, 1.0f / 2000.0f, top(pc), top) * 0.0015f);
             }
-            base = base * (1.0f - alpha) + lit(CLOUD_ALBEDO, nc, pc, v, 1.0f) * alpha;
+            // (cloud_color is slightly blue for water clouds: the view path's
+            // extinction yellows cloud tops otherwise)
+            base = base * (1.0f - alpha) + lit(W.cloud_color, nc, pc, v, 1.0f) * alpha;
             if (alpha > 0.25f) what = Seen::Cloud;  // cloud edges would eat the land colours
         }
     }
@@ -263,7 +301,10 @@ Shaded shade(const Scene& S, const View& v, const Ray& r) {
     float t_surface = alpha > 0.5f ? c0 : ground ? g0 : (alpha > 0.0f ? c0 : -1.0f);
     // The disk view keeps a real-thickness atmosphere over the planet (clean
     // colours) and only draws its glow rim off the edge with a thicker shell.
-    float scale = t_surface < 0.0f && v.rim_scale > 0.0f ? v.rim_scale : v.atmo_scale;
+    // The glow shell is exaggerated ~6x: on worlds with a taller atmosphere
+    // (Titan's scale height is ~6x Earth's) cap it at twice Earth's glow.
+    float scale = t_surface < 0.0f && v.rim_scale > 0.0f ? v.rim_scale * std::min(1.0f, 2.0f / W.optics.height)
+                                                         : v.atmo_scale;
     return {atmosphere(o, d, base, t_surface, v.to_sun, v.sun_color, scale,
-                        alpha > 0.5f ? 1.0f : v.haze), what};  // cloud tops sit above the haze
+                        alpha > 0.5f ? 1.0f : v.haze, W.optics), what};  // cloud tops sit above the haze
 }

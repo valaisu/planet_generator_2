@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "camera.h"
+#include "planet.h"
 #include "post.h"
 #include "render.h"
 
@@ -27,8 +28,9 @@ constexpr float AMBIENT = 0.04f;
 // exaggerated disk-view atmosphere, ~1/6 = Earth's real thickness (low orbit);
 // the vertical optical depth stays Earth's either way.
 // `haze` scales the in-scattered light over a surface (not the limb or sky).
+// `opt` scales Earth's coefficients / heights for other worlds (off = airless).
 Vec3 atmosphere(Vec3 origin, Vec3 dir, Vec3 base, float t_surface, Vec3 to_sun,
-                Vec3 sun_color, float scale, float haze = 1.0f);
+                Vec3 sun_color, float scale, float haze = 1.0f, const AtmoOptics& opt = AtmoOptics{});
 
 // Ray through image-space point (x, y) of a w x h image (row 0 = top; pixel
 // centres at +0.5).

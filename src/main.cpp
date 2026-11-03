@@ -7,6 +7,10 @@
 //            orbits 0 = fixed camera; weather time per frame, 0 = frozen clouds)
 //            [--view leo --frames N [--km-per-frame 1]]      (LEO fly-along; clouds frozen)
 //            [--vibrance 1.3]                                (saturation boost before the palette)
+//   earthgen --planet NAME --describe   (physics "planet card" of a preset; no rendering)
+//            [--star-mass M --orbit-au A --mass M_E --age GYR --day-hours H --volatiles F]  (override inputs)
+//            [--world key=value,...]  (override WorldSpec knobs after the physics, e.g. scarps=2,streaks=0)
+//   earthgen --check-presets            (derived vs real values for every preset)
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -18,6 +22,7 @@
 #include "earth.h"
 #include "image_io.h"
 #include "maps.h"
+#include "physics.h"
 #include "planet.h"
 #include "shade.h"
 #include "surface.h"
@@ -38,7 +43,9 @@ int main(int argc, char** argv) {
     float yaw_deg = 0.0f, sun_az = 0.0f;
     int n_frames = 0;
     float orbits = 1.0f, cloud_minutes = 20.0f, km_per_frame = 1.0f, vibrance = 1.3f;
-    bool raw = false, plain_palette = false, leo = false;
+    bool raw = false, plain_palette = false, leo = false, describe_only = false, physics_world = false;
+    PhysicalInputs phys;
+    std::string world_knobs;  // --world key=value,... (after the physics)
     LeoParams leo_prm;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -75,12 +82,42 @@ int main(int argc, char** argv) {
         else if (a == "--height") height = std::atoi(next());
         else if (a == "--plain-palette") plain_palette = true;
         else if (a == "--scale") scale = std::atoi(next());
+        else if (a == "--planet") {
+            std::string name = next();
+            physics_world = true;
+            if (!planet_preset(name, phys)) {
+                std::fprintf(stderr, "unknown planet %s (presets:", name.c_str());
+                for (const std::string& n : preset_names()) std::fprintf(stderr, " %s", n.c_str());
+                std::fprintf(stderr, ")\n");
+                return 2;
+            }
+        }
+        else if (a == "--describe") describe_only = true;
+        else if (a == "--world") world_knobs += (world_knobs.empty() ? "" : ",") + std::string(next());  // repeatable
+        else if (a == "--star-mass") phys.star_mass = std::atof(next());   // physics inputs: override a preset
+        else if (a == "--orbit-au") phys.orbit_au = std::atof(next());
+        else if (a == "--mass") phys.mass = std::atof(next());
+        else if (a == "--age") phys.age_gyr = std::atof(next());
+        else if (a == "--day-hours") phys.day_hours = std::atof(next());
+        else if (a == "--volatiles") phys.volatile_fraction = std::atof(next());
+        else if (a == "--check-presets") { check_presets(); return 0; }
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
+    }
+
+    if (describe_only) {
+        describe(phys, derive(phys));
+        return 0;
     }
 
     // --- Simulate ---------------------------------------------------------------
     double t0 = now_s();
     Planet planet(prm.grid_n);
+    if (physics_world) {  // --planet: the stages build what the physics derives
+        planet.world = world_from_physics(phys, derive(phys), prm);
+        std::fprintf(stderr, "%s: land %.2f, clouds %.2f%s, craters %.2g\n", phys.name.c_str(), prm.land_fraction,
+                     prm.cloud_amount, planet.world.deck ? " (deck)" : "", planet.world.crater_density);
+    }
+    if (!world_knobs.empty() && !set_world_knobs(planet.world, world_knobs)) return 2;
     if (!earth_path.empty()) {
         if (!load_earth_terrain(planet, earth_path)) {
             std::fprintf(stderr, "could not read %s\n", earth_path.c_str());
@@ -89,15 +126,17 @@ int main(int argc, char** argv) {
     } else {
         generate_terrain(planet, prm);
         std::fprintf(stderr, "terrain %.2fs\n", now_s() - t0);
-        erode(planet, prm);  // real Earth relief is already eroded
+        if (planet.world.crater_density > 0.0f) add_craters(planet, prm);
+        if (planet.world.erosion) erode(planet, prm);  // real Earth relief is already eroded
     }
     std::fprintf(stderr, "terrain+erosion %.2fs\n", now_s() - t0);
     simulate_climate(planet, prm);
     compute_drainage(planet);
-    place_cities(planet, prm);
+    if (planet.world.lights) place_cities(planet, prm);
     std::fprintf(stderr, "climate %.2fs\n", now_s() - t0);
     CloudSimPtr weather;
-    if (cloud_image.empty()) weather = start_clouds(planet, prm);
+    if (cloud_image.empty() && prm.cloud_amount <= 0.0f && planet.world.dust <= 0.0f) clear_clouds(planet);
+    else if (cloud_image.empty()) weather = start_clouds(planet, prm);
     else if (!load_cloud_image(planet, cloud_image)) {
         std::fprintf(stderr, "could not read %s\n", cloud_image.c_str());
         return 1;
@@ -117,7 +156,10 @@ int main(int argc, char** argv) {
                     : disk_view(width ? width : size, yaw_deg, sun_az);
     const int W = view.width, H = view.height;
     SurfaceColors surf = surface_albedo(planet, prm.seed);
-    std::vector<Vec3> relief = relief_normals(planet, view.relief);
+    // Slopes are exaggerated so Earth's gentle relief shows at 128 px; rugged
+    // worlds (craters, giant shields) need far less.
+    const float wr = planet.world.relief;
+    std::vector<Vec3> relief = relief_normals(planet, view.relief / (wr * wr) * planet.world.shading);
     Scene scene{planet, surf, relief, earth_background(), prm.seed};
 
     struct Frame {
@@ -138,6 +180,25 @@ int main(int argc, char** argv) {
                 f.px[i] = pack_rgba(sum / static_cast<float>(ss * ss));
                 f.seen[i] = shade(scene, v, pixel_ray(v.cam, x + 0.5f, y + 0.5f, W, H)).what;
             }
+        // Camera-like exposure (lifeless worlds): the lit planet's 95th-percentile
+        // luma -> world.auto_p95, applied before the grade.
+        if (planet.world.auto_p95 > 0.0f) {
+            std::vector<float> lum;
+            for (size_t i = 0; i < f.px.size(); ++i)
+                if (f.seen[i] != Seen::Space) {
+                    uint32_t p = f.px[i];
+                    lum.push_back(0.299f * (p & 255) / 255.0f + 0.587f * ((p >> 8) & 255) / 255.0f + 0.114f * ((p >> 16) & 255) / 255.0f);
+                }
+            if (lum.size() > 16) {
+                std::nth_element(lum.begin(), lum.begin() + lum.size() * 95 / 100, lum.end());
+                float k = planet.world.auto_p95 / std::max(0.02f, lum[lum.size() * 95 / 100]);
+                for (size_t i = 0; i < f.px.size(); ++i)
+                    if (f.seen[i] != Seen::Space) {
+                        uint32_t p = f.px[i];
+                        f.px[i] = pack_rgba(Vec3((p & 255) / 255.0f, ((p >> 8) & 255) / 255.0f, ((p >> 16) & 255) / 255.0f) * k);
+                    }
+            }
+        }
         // Grade: more saturation everywhere before the palette crush (--vibrance).
         if (!raw)
             for (uint32_t& p : f.px) {
@@ -179,7 +240,10 @@ int main(int argc, char** argv) {
     PostProcess pp;
     pp.enabled = !raw;
     if (palette_path.empty()) {
-        enum { SPACE, OCEAN, LAND, CLOUD, LIGHTS, COAST, NCLASS };
+        enum { SPACE, OCEAN, LAND, CLOUD, LIGHTS, COAST, SHADOW, NCLASS };
+        // Lifeless worlds: unlit/terminator pixels share 2 dark tones, so the
+        // palette is spent on the lit surface (Earth keeps its calibrated split).
+        const bool shadow_class = !planet.world.biomes && !plain_palette;
         std::vector<Vec3> samples[NCLASS];
         const size_t stride = frames.size() > 1 ? 7 : 1;  // keeps k-means fast on long animations
         for (const Frame& fr : frames)
@@ -191,9 +255,11 @@ int main(int argc, char** argv) {
                         : w == Seen::Land ? LAND : OCEAN;
                 if (plain_palette && w == Seen::Space) continue;
                 uint32_t v = fr.px[i];
-                samples[cls].push_back(Vec3((v & 255) / 255.0f, ((v >> 8) & 255) / 255.0f, ((v >> 16) & 255) / 255.0f));
+                Vec3 col((v & 255) / 255.0f, ((v >> 8) & 255) / 255.0f, ((v >> 16) & 255) / 255.0f);
+                if (shadow_class && cls != SPACE && 0.299f * col.x + 0.587f * col.y + 0.114f * col.z < 0.07f) cls = SHADOW;
+                samples[cls].push_back(col);
             }
-        int k[NCLASS] = {0, colors - 1, 0, 0, 0, 0};
+        int k[NCLASS] = {0, colors - 1, 0, 0, 0, 0, 0};
         if (!plain_palette) {
             const int budget = colors - 2;
             k[SPACE] = 1;
@@ -209,6 +275,13 @@ int main(int argc, char** argv) {
                 k[OCEAN] -= 1;
                 k[CLOUD] -= 1;
             }
+            // Other worlds: a class that is (nearly) absent (no ocean, no clouds,
+            // or no ground under a deck) gives its colours to the biggest one.
+            size_t total = samples[OCEAN].size() + samples[LAND].size() + samples[CLOUD].size();
+            int big = samples[CLOUD].size() > samples[LAND].size() ? CLOUD : LAND;
+            for (int c : {OCEAN, LAND, CLOUD})
+                if (c != big && samples[c].size() < total / 50) { k[big] += k[c]; k[c] = 0; }
+            if (shadow_class && samples[SHADOW].size() >= 8) { k[SHADOW] = 2; k[big] -= 2; }
         }
         pp.palette = {scene.bg.sky};
         if (k[LIGHTS] > 0) pp.palette.push_back(Vec3(0.42f, 0.43f, 0.50f));  // star grey

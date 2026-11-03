@@ -57,7 +57,15 @@ bool write_map(const std::string& path, int w, const std::function<Vec3(Vec3)>& 
 void write_planet_maps(const Planet& P, const std::string& dir) {
     const CubeGrid& g = P.grid;
     const int W = 720;
-    write_map(dir + "/elevation.png", W, [&](Vec3 d) { return elevation_color(g.sample(P.elevation, d)); });
+    // Worlds without an ocean: stretch their (Earth-equivalent) relief over the
+    // land ramp, 0..5000 m.
+    std::vector<float> hmap = P.elevation;
+    if (!P.world.ocean) {
+        auto [lo, hi] = std::minmax_element(hmap.begin(), hmap.end());
+        float a = *lo, k = 5000.0f / std::max(1.0f, *hi - *lo);
+        for (float& h : hmap) h = 1.0f + (h - a) * k;
+    }
+    write_map(dir + "/elevation.png", W, [&](Vec3 d) { return elevation_color(g.sample(hmap, d)); });
     {
         std::vector<Vec3> nrm = relief_normals(P, 40.0f);
         write_map(dir + "/relief.png", W * 2, [&](Vec3 d) {
@@ -65,12 +73,12 @@ void write_planet_maps(const Planet& P, const std::string& dir) {
             CubeGrid::tangent_basis(d, e, n);
             Vec3 light = normalize(d * 0.6f - e + n);  // from the north-west
             float shade = std::max(0.0f, dot(normalize(g.sample(nrm, d)), light)) / std::max(0.2f, dot(d, light));
-            return elevation_color(g.sample(P.elevation, d)) * std::min(1.6f, 0.15f + 0.85f * shade);
+            return elevation_color(g.sample(hmap, d)) * std::min(1.6f, 0.15f + 0.85f * shade);
         });
     }
     // Rivers (drainage >= 1.5e4, as rendered; log scale) + cities (orange, brighter = bigger) over
     // habitability (dark green = empty, light = favourable).
-    if (!P.drainage.empty()) {
+    if (!P.drainage.empty() && !P.habitability.empty()) {
         std::vector<float> city_cell(g.size(), 0.0f);
         for (const City& ct : P.cities) city_cell[g.cell_of(ct.dir)] += ct.size;
         write_map(dir + "/rivers_cities.png", W * 2, [&](Vec3 d) {
@@ -139,6 +147,11 @@ void write_planet_maps(const Planet& P, const std::string& dir) {
         write_map(dir + "/vorticity.png", W, [&](Vec3 d) {
             float z = g.sample(P.weather_vorticity, d) * (d.y >= 0 ? 1.0f : -1.0f);  // >0 cyclonic
             return ramp({{-8, {0.1f, 0.2f, 0.8f}}, {0, {0.9f, 0.9f, 0.9f}}, {8, {0.85f, 0.15f, 0.1f}}}, z);
+        });
+    if (!P.wind_dust.empty())
+        write_map(dir + "/wind_dust.png", W, [&](Vec3 d) {
+            float v = std::min(1.0f, g.sample(P.wind_dust, d) / 2.0f);
+            return Vec3(v, v, v);
         });
     if (!P.cloud.empty())  // raw opacity, greyscale (input for tools/cloud_stats.py)
         write_map(dir + "/cloud_alpha.png", W, [&](Vec3 d) {

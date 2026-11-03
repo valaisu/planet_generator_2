@@ -1,7 +1,7 @@
 // stylize_ref: turn a photo of Earth into a pixel-art reference in the same
 // framing, starfield and post-process as earthgen, so it's a direct target.
 //   stylize_ref <in.jpg> <out.png> [--size 128] [--colors 18] [--scale 4]
-//               [--thresh 0.03] [--circle cx,cy,r]
+//               [--thresh 0.03] [--circle cx,cy,r] [--raw]
 //   stylize_ref <in.jpg> <out.png> --frame [--crop x,y,w,h] [--width 256 --height 128]
 // The default (disk) mode finds the planet disk and reframes it like
 // `earthgen`'s disk view. --frame is for low-orbit photos (no disk): crop
@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
     std::string in = argv[1], out = argv[2];
     int size = 128, colors = 18, scale = 4;
     float thresh = 0.03f;
-    bool manual = false, frame = false;
+    bool manual = false, frame = false, raw = false;
     int fw = 256, fh = 128, crop[4] = {-1, -1, -1, -1};
     Circle disk{};
     for (int i = 3; i < argc; ++i) {
@@ -118,6 +118,7 @@ int main(int argc, char** argv) {
             manual = std::sscanf(next(), "%f,%f,%f", &disk.cx, &disk.cy, &disk.r) == 3;
             if (!manual) { std::fprintf(stderr, "--circle wants cx,cy,r\n"); return 2; }
         } else if (a == "--frame") frame = true;
+        else if (a == "--raw") raw = true;  // no palette/dither (for statistics vs `earthgen --raw`)
         else if (a == "--width") fw = std::atoi(next());
         else if (a == "--height") fh = std::atoi(next());
         else if (a == "--crop") {
@@ -148,7 +149,7 @@ int main(int argc, char** argv) {
         PostProcess pp;
         pp.palette = kmeans_palette(samples, colors - 1);
         pp.palette.insert(pp.palette.begin(), earth_background().sky);
-        apply_post(pp, fw, fh, fpx);
+        if (!raw) apply_post(pp, fw, fh, fpx);
         if (!write_png(out, fw, fh, fpx, scale) || !save_palette(stem + ".pal", pp.palette)) {
             std::fprintf(stderr, "could not write %s\n", out.c_str());
             return 1;
@@ -202,7 +203,7 @@ int main(int argc, char** argv) {
     PostProcess pp;
     pp.palette = kmeans_palette(samples, colors - 1);
     pp.palette.insert(pp.palette.begin(), bg.sky);
-    apply_post(pp, size, size, px);
+    if (!raw) apply_post(pp, size, size, px);
 
     if (!write_png(out, size, size, px, scale) || !save_palette(stem + ".pal", pp.palette)) {
         std::fprintf(stderr, "could not write %s\n", out.c_str());

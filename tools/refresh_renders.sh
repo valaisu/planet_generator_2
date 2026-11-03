@@ -7,6 +7,12 @@ rm -rf renders
 mkdir -p renders
 E=data/earth_relief_1deg.f32
 tools/sheet.sh renders/sheet.png 8 >/dev/null                       # seeds 1-8 + references
+tools/solar_sheet.sh renders/solar_sheet.png >/dev/null              # presets from physics vs photos
+uv run -q --no-project --with pillow python tools/pair_sheet.py renders/pair_sheet.png >/dev/null  # each reference | generated
+mkdir -p renders/planets
+for b in mercury venus earth mars europa titan pluto; do
+    ./build/earthgen --planet "$b" --out "renders/planets/$b.png" 2>/dev/null
+done
 tmp=$(mktemp -d)
 for s in 2 3 5; do ./build/earthgen --seed "$s" --view leo --out "$tmp/l$s.png" 2>/dev/null; done
 ffmpeg -loglevel error -y -i "$tmp/l2_x4.png" -i "$tmp/l3_x4.png" -i "$tmp/l5_x4.png" \
@@ -33,6 +39,9 @@ for a in orbit_seed3 clouds_seed3 leo_fly_seed3; do rm -rf "renders/${a}_frames"
 cat > renders/README.txt <<TXT
 Generated $(date '+%Y-%m-%d %H:%M') by tools/refresh_renders.sh — everything here is from that run.
 sheet.png              seeds 1-8 (disk view, 18-colour palette) above the 4 references
+solar_sheet.png        Mercury..Pluto rendered from their physics (--planet), under the stylized photos
+pair_sheet.png         every pixelized disk reference (left) next to its generated preset (right), labelled
+planets/<name>.png     each preset from its physics (+ _x4 upscale)
 leo_sheet.png          low Earth orbit: seeds 2, 3, 5, then references leo_0 (Florida), leo_1 (Sahara coast)
 seed2*.png, seed2_maps/            generated planet 2 + equirect maps of every field
 earth_australia*.png, earth_maps/  simulation run on real Earth relief (disk, Australia)
