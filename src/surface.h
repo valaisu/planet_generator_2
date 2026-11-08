@@ -27,6 +27,8 @@ struct SurfaceColors {
     std::vector<float> sand;  // 0..1: sandy coast (beach + cyan shallows) vs rocky/muddy
     std::vector<float> mud;   // 0..1: river sediment plume in the sea near big mouths
     std::vector<float> coast_km;  // distance to the other side of the coastline
+    std::vector<float> lava, lava_k;  // WorldSpec::lava: exposed melt 0..1 and its temperature (K); empty = none
+    float lava_peak = 0.0f;           // glow (max channel, x WorldSpec::thermal), 95th percentile by area: sets the exposure
     Vec3 at(const Planet& p, int c) const { return p.elevation[c] > 0.0f ? land[c] : ocean[c]; }
 };
 SurfaceColors surface_albedo(const Planet& p, uint32_t seed);

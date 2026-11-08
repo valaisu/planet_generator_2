@@ -46,7 +46,7 @@ Vec3 lit(Vec3 albedo, Vec3 n, Vec3 geo, const View& v, float shadow, float ls = 
     float law = mu0;
     if (ls > 0.0f) law += ls * (2.0f * mu0 / (mu0 + std::max(0.05f, dot(n, to_eye))) - mu0);
     float diffuse = law * smooth01(-0.03f, 0.08f, dot(geo, v.to_sun));
-    return vmul(albedo, Vec3(AMBIENT, AMBIENT, AMBIENT) + v.sun_color * ((1.0f - AMBIENT) * diffuse * shadow));
+    return vmul(albedo, Vec3(v.ambient, v.ambient, v.ambient) + v.sun_color * ((1.0f - AMBIENT) * diffuse * shadow));
 }
 constexpr float RIVER_MIN = 8e3f;  // drainage (km^2 at 1000 mm/yr; ~250 m^3/s) for a visible river
 const Vec3 LIGHT_COLOR(1.0f, 0.70f, 0.35f);  // sodium-orange city lights
@@ -111,6 +111,14 @@ Shaded shade(const Scene& S, const View& view, const Ray& r) {
     const WorldSpec& W = P.world;
     View v = view;
     v.sun_color = vmul(v.sun_color, W.star_color) * W.exposure;
+    // One exposure for glow and starlight: where the lava glow outshines the
+    // display, the camera exposes for it and the starlit ground, clouds and air
+    // dim with it (clipping only the glow left a bright starlit rim and terminator).
+    // Not under an opaque deck: it hides the glow (a dimmed deck rendered black).
+    float glow_k = 1.0f;
+    if (S.colors.lava_peak > 0.0f && !W.deck) glow_k = 1.0f / std::max(1.0f, S.colors.lava_peak * view.sun_color.y * W.exposure);
+    v.sun_color = v.sun_color * glow_k;
+    v.ambient = AMBIENT * glow_k;
     const CubeGrid& g = P.grid;
     const Vec3 off(static_cast<float>(S.seed % 101) * 1.7f, 3.1f, static_cast<float>(S.seed % 37) * 0.9f);
     Vec3 o = r.origin, d = normalize(r.direction);
@@ -155,6 +163,7 @@ Shaded shade(const Scene& S, const View& view, const Ray& r) {
 
     // Ground (or stars); nothing under an opaque deck.
     Vec3 base(0, 0, 0);
+    Vec3 glow(0, 0, 0);  // light the ground gives off itself (lava): no sunlight path reddening
     Seen what = Seen::Space;
     if (ground && !W.deck) {
         Vec3 n = normalize(o + d * g0);
@@ -252,6 +261,11 @@ Shaded shade(const Scene& S, const View& view, const Ray& r) {
             normal = normalize(n + (normal - n) * (1.0f - W.relief_light));
         }
         base = lit(albedo, normal, n, v, shadow, W.lommel_seeliger, d * -1.0f);
+        if (land && W.relief_light > 0.0f) {  // a mosaic is evenly lit: no phase darkening on the day side
+            float gate = smooth01(-0.03f, 0.08f, dot(n, v.to_sun));
+            Vec3 flat = vmul(albedo, Vec3(v.ambient, v.ambient, v.ambient) + v.sun_color * ((1.0f - AMBIENT) * gate * shadow));
+            base = base + (flat - base) * W.relief_light;
+        }
         // City lights on the night side (under the cloud layer, so clouds dim them).
         float night = smooth01(0.02f, -0.12f, dot(n, v.to_sun));
         if (land && night > 0.0f) {
@@ -260,8 +274,22 @@ Shaded shade(const Scene& S, const View& view, const Ray& r) {
             base = base + (LIGHT_COLOR + (Vec3(1.0f, 0.95f, 0.8f) - LIGHT_COLOR) * smooth01(0.6f, 1.5f, L)) * L;
             if (L > 0.08f) what = Seen::Lights;
         }
+        // Lava glows by its own heat (day and night): Planck radiance relative to
+        // the starlight here (WorldSpec::thermal), on the renderer's exposure.
+        if (!S.colors.lava.empty()) {
+            float m = g.sample(S.colors.lava, n);
+            if (m > 0.0f) {
+                Vec3 e = planck_rel(g.sample(S.colors.lava_k, n)) * (m * W.thermal * view.sun_color.y * W.exposure * glow_k);
+                // (interpolated cells can still exceed 1: clip keeping the colour;
+                // channel clipping turned it yellow-white)
+                float peak = std::max(e.x, std::max(e.y, e.z));
+                if (peak > 1.0f) e = e / peak;
+                glow = e;
+                if (0.299f * e.x + 0.587f * e.y + 0.114f * e.z > 0.08f) what = Seen::Lights;
+            }
+        }
     } else if (!shell || !W.deck) {
-        base = background(r, S.bg);
+        base = background(view.sky_turn == 0.0f ? r : Ray(r.origin, rotate_about(r.direction, Vec3(0, 1, 0), view.sky_turn)), S.bg);
     }
 
     // Cloud layer over it. A deck is opaque everywhere; the simulated weather
@@ -282,6 +310,7 @@ Shaded shade(const Scene& S, const View& view, const Ray& r) {
                                        - W.deck_asym * pc.y, 0.0f, 1.0f);
             Vec3 col = W.deck_dark + (W.deck_light - W.deck_dark) * shade_w;
             base = lit(col, pc, pc, v, 1.0f);
+            glow = Vec3(0, 0, 0);
             alpha = 1.0f;
             what = Seen::Cloud;
         } else if (alpha > 0.0f) {
@@ -292,7 +321,20 @@ Shaded shade(const Scene& S, const View& view, const Ray& r) {
             }
             // (cloud_color is slightly blue for water clouds: the view path's
             // extinction yellows cloud tops otherwise)
-            base = base * (1.0f - alpha) + lit(W.cloud_color, nc, pc, v, 1.0f) * alpha;
+            Vec3 cc = lit(W.cloud_color, nc, pc, v, 1.0f);
+            glow = glow * (1.0f - alpha);
+            // Over lava the cloud is lit from below: it passes on about half of
+            // the glow under it, diffused (the mean molten share of the area).
+            if (!P.lava_share.empty() && W.underglow > 0.0f) {
+                float m = g.sample(P.lava_share, pc);
+                if (m > 0.0f) {
+                    Vec3 e = planck_rel(g.sample(S.colors.lava_k, pc)) * (0.5f * W.underglow * m * W.thermal * view.sun_color.y * W.exposure * glow_k);
+                    float peak = std::max(e.x, std::max(e.y, e.z));
+                    if (peak > 1.0f) e = e / peak;
+                    glow = glow + vmul(W.cloud_color, e) * alpha;
+                }
+            }
+            base = base * (1.0f - alpha) + cc * alpha;
             if (alpha > 0.25f) what = Seen::Cloud;  // cloud edges would eat the land colours
         }
     }
@@ -303,8 +345,9 @@ Shaded shade(const Scene& S, const View& view, const Ray& r) {
     // colours) and only draws its glow rim off the edge with a thicker shell.
     // The glow shell is exaggerated ~6x: on worlds with a taller atmosphere
     // (Titan's scale height is ~6x Earth's) cap it at twice Earth's glow.
-    float scale = t_surface < 0.0f && v.rim_scale > 0.0f ? v.rim_scale * std::min(1.0f, 2.0f / W.optics.height)
+    float scale = t_surface < 0.0f && v.rim_scale > 0.0f ? v.rim_scale * W.optics.rim * std::min(1.0f, 2.0f / W.optics.height)
                                                          : v.atmo_scale;
-    return {atmosphere(o, d, base, t_surface, v.to_sun, v.sun_color, scale,
-                        alpha > 0.5f ? 1.0f : v.haze, W.optics), what};  // cloud tops sit above the haze
+    Vec3 col = atmosphere(o, d, base, t_surface, v.to_sun, v.sun_color, scale,
+                          alpha > 0.5f ? 1.0f : v.haze * W.optics.haze, W.optics, glow);  // cloud tops sit above the haze
+    return {t_surface >= 0.0f ? col * view.gain : col, what};
 }

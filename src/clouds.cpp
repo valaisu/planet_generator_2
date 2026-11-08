@@ -187,17 +187,22 @@ struct CloudSim {
     float time = 0.0f, dt_prev = 0.0f;
     float time_per_minute = 0.0f;  // animations: model time per real minute (calibrated)
     // Wind-blown dust (WorldSpec::dust): dust on the ground and in the air.
-    float dust_lift = 0.0f;
+    float dust_lift = 0.0f, P_frost_lat = 90.0f;  // (seasonal frost edge, deg: frozen ground lifts no dust)
     float stir_floor = 0.0f;  // dusty worlds: gusts/eddies at every latitude, not only storm tracks
     std::vector<float> ground_dust, air_dust, air_density, stress, dn;
     // Advected texture coordinates for the dust (as `origin` for the clouds, but
     // over a longer window): fine dust texture stretched and folded by the flow.
     std::vector<Vec3> dust_origin, dust_on;
     Vec3 dust_off;
+    // Lava (WorldSpec::lava): crust age carried by the flow (the barotropic flow
+    // stands in for the convecting melt's surface flow), reset to 0 over
+    // upwelling plumes (fixed to the deep convection, not advected).
+    std::vector<float> crust, crust_n, plume_w;
 
     CloudSim(const Planet& P, const PlanetParams& prm);
     void step(float dt, bool tracer, bool tex);
     void dust_step(float dt, bool tex);
+    void crust_step(float dt);
     void write(Planet& P);
 };
 // Model time unit ~2.5 days (radius 1, jet speed ~1 = 30 m/s): 1 minute = 1/3600.
@@ -277,13 +282,45 @@ CloudSim::CloudSim(const Planet& P, const PlanetParams& prm)
         // Tropical convection: warm, rainy air rises on its own (no vortex needed).
         convect[c] = smooth01(18.0f, 27.0f, P.temperature[k]) * smooth01(800.0f, 2500.0f, P.precip[k]);
     }
-    if (P.world.dust > 0.0f) {
+    // Steam over lava: hot melt drives convection, the rising air makes cloud.
+    if (!P.lava_share.empty())
+        for (int c = 0; c < NT; ++c) convect[c] += 0.5f * P.grid.sample(P.lava_share, gt.dir(c));
+    if (!P.lava_share.empty()) {
+        stir_floor = 0.8f;  // convection everywhere, not only in storm tracks
+        // Plumes where there is melt (rejection sampling on the molten share),
+        // 0.03-0.08 rad across.
+        std::vector<Vec3> pc;
+        std::vector<float> pr;
+        std::uniform_real_distribution<float> U(0.0f, 1.0f);
+        std::normal_distribution<float> G(0.0f, 1.0f);
+        for (int tries = 0; tries < 20000 && static_cast<int>(pc.size()) < static_cast<int>(P.world.lava_plumes); ++tries) {
+            Vec3 d = normalize(Vec3(G(rng), G(rng), G(rng)));
+            if (U(rng) * 0.85f > P.grid.sample(P.lava_share, d)) continue;
+            pc.push_back(d);
+            pr.push_back(0.03f + 0.05f * U(rng));
+        }
+        plume_w.assign(NT, 0.0f);
+        crust.resize(NT);
+        crust_n.resize(NT);
+        for (int c = 0; c < NT; ++c) {
+            Vec3 d = gt.dir(c);
+            for (size_t k = 0; k < pc.size(); ++k) {
+                Vec3 e = d - pc[k];
+                plume_w[c] = std::max(plume_w[c], std::exp(-dot(e, e) / (pr[k] * pr[k])));
+            }
+            // Old crust starts with smooth random ages (broad patches; the flow
+            // marbles them; a cascade's sparse peaks left only specks of old crust).
+            crust[c] = 6.0f * fbm3r(d * 2.0f + off * 2.3f, 3);
+        }
+    }
+    if (P.world.dust > 0.0f || P.world.snow_drift > 0.0f) {
         // Thinner air on high ground lifts less dust (Tharsis stays dusty).
         const CubeGrid& g = P.grid;
         double hm = 0.0;
         for (int c = 0; c < g.size(); ++c) hm += P.elevation[c] * g.area(c);
         const float h_scale = 8500.0f * P.world.optics.height;  // Earth-equivalent metres
         dust_lift = P.world.dust_lift;
+        P_frost_lat = P.world.frost_lat;
         stir_floor = 0.8f;
         // Regional elevation (craters blurred out: their floors would all scour).
         std::vector<float> h(NT), hn(NT);
@@ -424,6 +461,14 @@ void CloudSim::step(float dt, bool tracer, bool tex) {
 // windiest `dust_lift` share of the ground lifts its dust, the eddies carry it
 // (semi-Lagrangian, as the clouds) and it settles where the wind is weak. The
 // ground keeps the sum of many storms: fronts, filaments and tongues.
+// Lava crust: ages as the flow carries it, remelts over the plumes.
+void CloudSim::crust_step(float dt) {
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < NT; ++c)
+        crust_n[c] = (gt.sample(crust, depart(gw, u_mid, gt.dir(c), dt)) + dt) * (1.0f - plume_w[c]);
+    crust.swap(crust_n);
+}
+
 void CloudSim::dust_step(float dt, bool tex) {
     // Surface gusts come with the eddies, not the steady jet aloft (a model level
     // ~500 hPa): use the wind minus its zonal mean, else the jets scour bands.
@@ -446,17 +491,23 @@ void CloudSim::dust_step(float dt, bool tex) {
         Vec3 g = w[c] - e * static_cast<float>(ue[b] / std::max(wsum[b], 1e-12));
         stress[c] = dot(g, g) * air_density[c];
     }
-    // Threshold per latitude band (interpolated between band centres): which
-    // eddies are strongest varies a lot between runs and hemispheres, and a
-    // global threshold let one stormy hemisphere scour itself bare.
+    // Threshold per latitude band (interpolated between band centres), halfway
+    // (geometric mean) toward the global one: which eddies are strongest varies a
+    // lot between runs and hemispheres, and a global threshold let one stormy
+    // hemisphere scour itself bare; a pure per-band one gave every band the same
+    // dark share, so no dark belts (Mars' classical albedo belts) could form.
     constexpr int LB = 18;
     std::vector<std::vector<float>> by(LB);
     for (int c = 0; c < NT; ++c) by[std::clamp(static_cast<int>((lat_deg(gt.dir(c)) + 90.0f) / 180.0f * LB), 0, LB - 1)].push_back(stress[c]);
+    std::vector<float> all(stress.begin(), stress.end());
+    size_t kg = static_cast<size_t>((1.0f - dust_lift) * all.size());
+    std::nth_element(all.begin(), all.begin() + kg, all.end());
+    const float crit_global = std::max(1e-6f, all[kg]);
     float crit[LB];
     for (int b = 0; b < LB; ++b) {
         size_t k = static_cast<size_t>((1.0f - dust_lift) * by[b].size());
         std::nth_element(by[b].begin(), by[b].begin() + k, by[b].end());
-        crit[b] = std::max(1e-6f, by[b][k]);
+        crit[b] = std::sqrt(std::max(1e-6f, by[b][k]) * crit_global);
     }
     #pragma omp parallel for schedule(static)
     for (int c = 0; c < NT; ++c) {
@@ -464,7 +515,14 @@ void CloudSim::dust_step(float dt, bool tex) {
         float x = std::clamp((lat_deg(gt.dir(c)) + 90.0f) / 180.0f * LB - 0.5f, 0.0f, LB - 1.0f);
         int b0 = std::min(static_cast<int>(x), LB - 2);
         float r = stress[c] / (crit[b0] + (crit[b0 + 1] - crit[b0]) * (x - b0));
-        float lift = smooth01(1.0f, 1.4f, r) / TAU_LIFT * ground_dust[c];
+        // Seasonal frost (both poles in turn) locks the ground: no lift poleward
+        // of ~15 deg inside the cap edge, so high latitudes keep their dust.
+        float frozen = 0.0f;
+        if (P_frost_lat < 90.0f) {  // (ragged edge: the cap boundary wanders by ~+-8 deg)
+            float lat = std::fabs(lat_deg(gt.dir(c))) + 8.0f * (fbm3r(gt.dir(c) * 3.0f + Vec3(4.1f, 7.3f, 1.9f), 4) - 0.5f) / 0.12f;
+            frozen = smooth01(P_frost_lat - 15.0f, P_frost_lat, lat);
+        }
+        float lift = smooth01(1.0f, 1.4f, r) / TAU_LIFT * ground_dust[c] * (1.0f - frozen);
         float settle = (1.0f - smooth01(0.3f, 1.0f, r)) / TAU_SETTLE * a;
         ground_dust[c] += dt * (settle - lift);
         dn[c] = a + dt * (lift - settle);
@@ -551,8 +609,13 @@ void CloudSim::write(Planet& P) {
         P.weather_vorticity[c] = gw.sample(zeta, g.dir(c));
         P.cloud_wind[c] = gw.sample(u, g.dir(c));
     }
+    if (!crust.empty()) {
+        P.crust_age.resize(g.size());
+        for (int c = 0; c < g.size(); ++c) P.crust_age[c] = gt.sample(crust, g.dir(c));
+    }
     if (!ground_dust.empty()) {
-        P.wind_dust.resize(g.size());
+        std::vector<float>& out = P.world.snow_drift > 0.0f && P.world.dust <= 0.0f ? P.snow : P.wind_dust;
+        out.resize(g.size());
         // Ground dust x a bounded cascade at the flow-advected coordinates: the
         // tracer gives the regions, the stretched cascade their filaments,
         // feathered fronts and the mottling inside (down to ~2 disk pixels).
@@ -562,7 +625,7 @@ void CloudSim::write(Planet& P) {
             Vec3 d = g.dir(c), o = normalize(gt.sample(dust_origin, d));
             float cas = 1.0f;
             for (int n = 0; n < oct; ++n) cas *= cascade_step(o, dust_off, n);
-            P.wind_dust[c] = gt.sample(ground_dust, d) * (1.0f + P.world.dust_texture * (cas - 1.0f));
+            out[c] = gt.sample(ground_dust, d) * (1.0f + P.world.dust_texture * (cas - 1.0f));
         }
         if (std::getenv("DUST_DEBUG")) {  // per 20-deg band: air density, last stress, ground dust
             for (int b = 0; b < 9; ++b) {
@@ -586,11 +649,12 @@ CloudSimPtr start_clouds(Planet& P, const PlanetParams& prm) {
     // run it at the end, once the flow is developed; the texture window covers
     // the last TEX_STEPS steps.
     // Dust runs over the last dust_steps steps (after a 200-step spin-up).
-    const int dust_steps = P.world.dust > 0.0f ? static_cast<int>(P.world.dust_steps) : 0;
+    const int dust_steps = P.world.dust > 0.0f || P.world.snow_drift > 0.0f ? static_cast<int>(P.world.dust_steps) : 0;
     const int steps = std::max(STEPS, 200 + dust_steps);
     for (int s = 0; s < steps; ++s) {
         sim->step(DT, s >= steps - 150, s >= steps - TEX_STEPS - 1);
         if (s >= steps - dust_steps) sim->dust_step(DT, s >= steps - static_cast<int>(P.world.dust_window));
+        if (!sim->crust.empty() && s >= steps - static_cast<int>(P.world.lava_steps)) sim->crust_step(DT);
     }
     sim->write(P);
     return sim;

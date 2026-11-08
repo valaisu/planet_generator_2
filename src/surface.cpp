@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 #include "surface.h"
 
@@ -55,6 +57,37 @@ const Vec3 SILT{0.24f, 0.30f, 0.22f};
 #include "noise.h"
 
 namespace {
+// Cellular (Worley) noise: distance between the nearest and the second-nearest
+// feature point (0 on the cell borders), one jittered point per lattice cell.
+float worley_edge(Vec3 p) {
+    Vec3 f(std::floor(p.x), std::floor(p.y), std::floor(p.z));
+    float d1 = 9.0f, d2 = 9.0f;
+    for (int i = -1; i <= 1; ++i)
+        for (int j = -1; j <= 1; ++j)
+            for (int k = -1; k <= 1; ++k) {
+                Vec3 c = f + Vec3(static_cast<float>(i), static_cast<float>(j), static_cast<float>(k));
+                Vec3 q = c + Vec3(hash31(c.x, c.y, c.z), hash31(c.x + 17.1f, c.y, c.z), hash31(c.x, c.y + 31.7f, c.z));
+                float d = length(q - p);
+                if (d < d1) { d2 = d1; d1 = d; }
+                else if (d < d2) d2 = d;
+            }
+    return d2 - d1;
+}
+
+// Rank (0..1) of every value in v.
+std::vector<float> ranks(const std::vector<float>& v) {
+    std::vector<int> idx(v.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = static_cast<int>(i);
+    std::sort(idx.begin(), idx.end(), [&](int a, int b) { return v[a] < v[b]; });
+    std::vector<float> r(v.size());
+    // Ties share their mean rank: ordering them by cell index drew the cube faces
+    // (a constant field, e.g. no precipitation, gave seams at face edges and mid-face).
+    for (size_t i = 0, j; i < idx.size(); i = j) {
+        for (j = i + 1; j < idx.size() && v[idx[j]] == v[idx[i]]; ++j) {}
+        for (size_t k = i; k < j; ++k) r[idx[k]] = (0.5f * (i + j)) / idx.size();
+    }
+    return r;
+}
 // Lifeless worlds: the material model (WorldSpec colours) mixed per cell. Regions
 // are soft and domain-warped (fractal edges, no thresholded blobs) and mottled
 // inside; the terrain modulates albedo by process (slope_albedo, crest_albedo);
@@ -64,7 +97,7 @@ namespace {
 // basin); fresh-crater rays; ice (cap edge / volatile ice in basin and toward
 // the poles). `slope` (0..1+) and `crest` (~-2..2, local relief in sd) per cell.
 // (fbm3 with 4-5 octaves: median 0.5, sd ~0.12.)
-Vec3 material_color(const Planet& P, int c, Vec3 d, Vec3 off, float slope, float crest, float lows, float pole_face, float dust) {
+Vec3 material_color(const Planet& P, int c, Vec3 d, Vec3 off, float slope, float crest, float lows, float pole_face, float dust, float snow) {
     const WorldSpec& W = P.world;
     auto share = [](float amount) { return 0.5f + 0.12f * 1.6f * (1.0f - 2.0f * amount); };  // fbm threshold
     auto warp = [&](Vec3 p, float k) {
@@ -75,6 +108,36 @@ Vec3 material_color(const Planet& P, int c, Vec3 d, Vec3 off, float slope, float
     float fine = fbm3(d * 24.0f + off * 3.1f, 3);  // ~1-3 px; finer noise only dithers into grain
     Vec3 col = W.rock;
     float young = P.resurfaced.empty() ? 0.0f : P.resurfaced[c];
+    // Material colours. Physical icy surfaces (WorldSpec::absorber_floor) keep
+    // the same regions but take each material's colour from clean ice + an
+    // absorber column (Beer-Lambert) set by the processes there.
+    Vec3 rock_c = W.rock, dark_c = W.dark * W.dark_level, bright_c = W.bright, ice_c = W.ice;
+    const bool physical = W.absorber_floor.x > 0.0f;
+    float t0 = 0.0f, t_stain = 0.0f;
+    auto contaminated = [&](float t, Vec3 ice) {
+        Vec3 e(std::exp(-W.absorber_k.x * t), std::exp(-W.absorber_k.y * t), std::exp(-W.absorber_k.z * t));
+        Vec3 span = ice - W.absorber_floor;
+        return W.absorber_floor + Vec3(span.x * e.x, span.y * e.y, span.z * e.z);
+    };
+    if (physical) {
+        // Corotating magnetospheric plasma (sulfur ions) overtakes the moon and
+        // hits its trailing hemisphere (apex: lon 0, the default disk view's
+        // centre): a dose bullseye. Haze fallout leaves a trace of tholin even in
+        // the frost veneer (cream).
+        float dose = std::pow(std::max(0.0f, d.z), 0.7f);
+        t0 = W.trailing * dose + 0.015f * W.fallout + W.weathering * (1.0f - young);
+        rock_c = contaminated(t0, W.ice_clean);
+        // Old patches: coarser grains (water ice loses red: blue-grey), more absorber.
+        dark_c = contaminated(2.0f * t0 + 0.1f, W.ice_clean - W.coarse_ice);
+        // Stained ground: endogenic brine (chaos, lineae) radiolysed with the dose,
+        // or ground the volatile frost left bare, collecting fallout for Gyr. The
+        // stain is mixed into the ice, so its local amount sets the column (below).
+        // (no magnetospheric plasma, no bullseye: only the brine's own colour)
+        t_stain = W.brine * (0.35f + 0.65f * (W.trailing > 0.0f ? dose : 0.0f)) + W.fallout;
+        bright_c = contaminated(0.0f, W.ice_clean);                // fresh ejecta: clean ice from below
+        ice_c = contaminated(0.015f * W.fallout, W.ice_clean);     // renewed N2 / CH4 frost
+    }
+    col = rock_c;
     // Dark regions: soft edges, broken up inside by the fine noise.
     float t = share(W.dark_amount);
     float dk = smooth01(t - 0.08f * W.edge, t + 0.08f * W.edge, fbm3(q * 3.0f + off, 5) + 0.2f * (fine - 0.5f));
@@ -84,12 +147,12 @@ Vec3 material_color(const Planet& P, int c, Vec3 d, Vec3 off, float slope, float
         // ... and dark sand collects in hollows at every scale (lows between
         // knobs, big crater floors and basins: `lows` ~100 km; dunes on the
         // downwind side of crater floors), less where dust blankets everything.
-        float hollow = 0.3f * smooth01(-0.3f, -1.5f, crest) + 0.7f * smooth01(-0.3f, -1.5f, lows);
+        float hollow = 0.3f * smooth01(-0.3f, -1.5f, crest) + 0.7f * smooth01(-0.8f, -2.5f, lows);  // (lows: robust scale)
         float floor_sand = P.crater_sand.empty() ? 0.0f : P.crater_sand[c];
-        dark_w += W.sand_lows * (hollow + floor_sand) * (0.15f + 0.85f * (1.0f - dust));
+        dark_w += W.sand_lows * (hollow + 0.4f * floor_sand) * (0.15f + 0.85f * (1.0f - dust));
     }
     if (W.slope_albedo < 0.0f) dark_w += -W.slope_albedo * std::min(1.0f, slope) * (0.5f + 0.5f * smooth01(0.0f, 1.5f, crest));
-    col = mix(col, W.dark * W.dark_level, W.dark_mix * std::clamp(dark_w, 0.0f, 1.0f));
+    col = mix(col, dark_c, W.dark_mix * std::clamp(dark_w, 0.0f, 1.0f));
     if (W.alt_amount > 0.0f) {  // third material: new hue, same brightness
         float ta = share(W.alt_amount);
         float aw = smooth01(ta - 0.10f * W.edge, ta + 0.10f * W.edge, fbm3(q * 1.7f + off * 3.7f, 4) + 0.2f * (fine - 0.5f));
@@ -110,19 +173,30 @@ Vec3 material_color(const Planet& P, int c, Vec3 d, Vec3 off, float slope, float
             // a low-latitude belt, broken in places (Cthulhu), mottled
             float lat = std::fabs(std::asin(q.y)) * 57.3f;
             float ts = share(W.stain_amount);
-            float belt = smooth01(40.0f, 15.0f, lat + 25.0f * (fbm3(q * 2.0f + off, 4) - 0.5f));
+            float belt = smooth01(W.volatile_band + 10.0f, W.volatile_band - 15.0f, lat + 25.0f * (fbm3(q * 2.0f + off, 4) - 0.5f));
             st = belt * (1.0f - young) * smooth01(ts - 0.07f * W.edge, ts + 0.07f * W.edge, fbm3(q * 1.2f + off * 2.7f, 4)) * (0.7f + 0.6f * fine);
         }
-        col = mix(col, W.stain, std::clamp(st, 0.0f, 1.0f));
+        st = std::clamp(st, 0.0f, 1.0f);
+        // Brine is mixed into the ice (its amount sets the column); bare ground
+        // lies beside the frost (areal: a linear mix).
+        if (physical && W.brine > 0.0f) col = mix(col, contaminated(t0 + t_stain * std::min(1.0f, 1.4f * st), W.ice_clean), std::min(1.0f, 2.0f * st));
+        else if (physical) col = mix(col, contaminated(t0 + t_stain, W.ice_clean), st);
+        else col = mix(col, W.stain, st);
     }
-    if (W.slope_albedo > 0.0f) col = mix(col, W.bright, W.slope_albedo * std::min(1.0f, slope));
+    if (W.slope_albedo > 0.0f) col = mix(col, bright_c, W.slope_albedo * std::min(1.0f, slope));
     // Rays show where fresh ejecta are brighter than the weathered surface
     // (dark rock); on bright ice they barely register.
     auto lum = [](Vec3 v) { return 0.299f * v.x + 0.587f * v.y + 0.114f * v.z; };
-    float ray_contrast = std::clamp((lum(W.bright) - lum(col)) / 0.25f, 0.0f, 1.0f);
+    float ray_contrast = std::clamp((lum(bright_c) - lum(col)) / 0.25f, 0.0f, 1.0f);
     if (W.glacier_basin) ray_contrast = 0.0f;  // volatile frost transport blankets fresh ejecta
-    if (!P.ray.empty()) col = mix(col, W.bright, 0.85f * ray_contrast * P.ray[c]);
-    if (!P.streak.empty()) col = mix(col, W.bright, std::min(1.0f, 0.45f * W.streak_strength * P.streak[c]));
+    if (!P.ray.empty()) col = mix(col, bright_c, 0.85f * ray_contrast * P.ray[c]);
+    if (!P.streak.empty()) {
+        // Wind streaks: in scoured (dark) ground dust settles in the lee (bright
+        // tails); in dusty ground the lee is scoured instead (dark tails).
+        float st = std::min(1.0f, 0.45f * W.streak_strength * P.streak[c]);
+        if (W.dust > 0.0f) col = mix(mix(col, W.bright, st * (1.0f - dust)), W.dark * W.dark_level, 0.35f * st * dust);
+        else col = mix(col, W.bright, st);
+    }
     float ice = smooth01(W.ice_below + 3.0f, W.ice_below - 3.0f, P.temperature[c] - 4.0f * (fine - 0.5f) / 0.12f);
     if (W.glacier_basin) {
         float lat = std::fabs(std::asin(q.y)) * 57.3f;
@@ -132,12 +206,17 @@ Vec3 material_color(const Planet& P, int c, Vec3 d, Vec3 off, float slope, float
     if (W.frost_lat < 90.0f && d.y < 0.0f) {  // winter (southern) seasonal frost cap, ragged edge
         // Frost lasts longest in the cold spots: pole-facing slopes and hollows,
         // so the cap edge breaks into frosted crater walls and floors.
-        float cold = 6.0f * pole_face + 4.0f * smooth01(-0.3f, -1.5f, lows) + 3.0f * smooth01(-0.3f, -1.5f, crest);
+        float cold = 6.0f * pole_face + 4.0f * smooth01(-0.8f, -2.5f, lows) + 3.0f * smooth01(-0.3f, -1.5f, crest);
         float lat = -std::asin(std::clamp(q.y, -1.0f, 0.0f)) * 57.2958f + 10.0f * (fine - 0.5f) / 0.12f * 0.3f + cold;
-        float fr = smooth01(W.frost_lat - 2.0f, W.frost_lat + 4.0f, lat);
-        col = mix(col, W.frost, 0.9f * fr);
+        // Solid only well inside the cap; toward its edge only the cold spots
+        // (pole-facing walls, hollows) keep frost: scattered bright patches.
+        float spot = smooth01(0.0f, 0.3f, pole_face) + 0.6f * smooth01(-0.3f, -1.2f, crest);
+        float fr = std::max(smooth01(W.frost_lat + 6.0f, W.frost_lat + 12.0f, lat),
+                            std::min(1.0f, spot) * smooth01(W.frost_lat - 12.0f, W.frost_lat - 2.0f, lat));
+        col = mix(col, W.frost, 0.9f * fr * smooth01(0.0f, -0.25f, d.y));  // (high obliquity: the cap reaches the equator)
     }
-    col = mix(col, W.ice, std::clamp(ice, 0.0f, 1.0f));
+    if (snow < 1.0f) ice_c = mix(W.blue_ice, ice_c, snow);  // wind-scoured: bare glacier ice
+    col = mix(col, ice_c, std::clamp(ice, 0.0f, 1.0f));
     // Small-scale mottling (the 1-3 px texture) on top of the gentle base noise.
     float l = lum(col);
     col = Vec3(l, l, l) + (col - Vec3(l, l, l)) * W.saturation;
@@ -156,7 +235,7 @@ std::vector<float> dust_cover(const Planet& P, const std::vector<float>& lows) {
     const int N = g.size();
     if (P.wind_dust.empty()) return std::vector<float>(N, 1.0f);
     std::vector<float> wd = P.wind_dust, nx(N);
-    const int iters = static_cast<int>(std::lround(8.0f * (g.n() / 256.0f) * (g.n() / 256.0f)));
+    const int iters = static_cast<int>(std::lround(3.0f * (g.n() / 256.0f) * (g.n() / 256.0f)));
     for (int it = 0; it < iters; ++it) {
         #pragma omp parallel for schedule(static)
         for (int c = 0; c < N; ++c) {
@@ -166,8 +245,26 @@ std::vector<float> dust_cover(const Planet& P, const std::vector<float>& lows) {
         }
         wd.swap(nx);
     }
+    if (std::getenv("DUST_DEBUG")) {
+        std::vector<float> a = wd, b = lows;
+        std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
+        for (float q : {0.05f, 0.25f, 0.5f, 0.75f, 0.95f})
+            std::fprintf(stderr, "dust_cover q%.2f wind %.4g terrain %.3f\n", q, a[static_cast<size_t>(q * N)], b[static_cast<size_t>(q * N)]);
+    }
+    // The wind's share and the terrain's on one scale: wind dust as a z-score of
+    // its area rank (logit / 1.7 ~ probit), terrain in sd.
     std::vector<std::pair<float, int>> order(N);
-    for (int c = 0; c < N; ++c) order[c] = {std::log(std::max(wd[c], 1e-4f)) + 0.3f * std::clamp(lows[c], -3.0f, 3.0f), c};
+    for (int c = 0; c < N; ++c) order[c] = {wd[c], c};
+    std::sort(order.begin(), order.end());
+    {
+        double acc = 0.0, total = 0.0;
+        for (int c = 0; c < N; ++c) total += g.area(c);
+        for (auto& [v, c] : order) {
+            float r = std::clamp(static_cast<float>((acc + 0.5 * g.area(c)) / total), 1e-4f, 1.0f - 1e-4f);
+            acc += g.area(c);
+            v = std::log(r / (1.0f - r)) / 1.7f + 0.15f * std::clamp(lows[c], -3.0f, 3.0f);
+        }
+    }
     std::sort(order.begin(), order.end());
     std::vector<float> dust(N);
     double acc = 0.0, total = 0.0;
@@ -211,7 +308,9 @@ SurfaceColors surface_albedo(const Planet& P, uint32_t seed) {
         const int N = g.size();
         slope_n.resize(N);
         const float km_scale = (g.n() / 256.0f) * (g.n() / 256.0f);
-        auto relief_at = [&](int iters) {
+        // (robust: scaled by the 16-84 % half-range, not the sd, which a few huge
+        // features (canyons, shields, basins) dominate: ordinary lows were ~0.05 sd.)
+        auto relief_at = [&](int iters, bool robust = false) {
             std::vector<float> b = P.elevation, nx(N);
             for (int it = 0; it < static_cast<int>(std::lround(iters * km_scale)); ++it) {
                 #pragma omp parallel for schedule(static)
@@ -225,14 +324,21 @@ SurfaceColors surface_albedo(const Planet& P, uint32_t seed) {
             double var = 0.0;
             for (int c = 0; c < N; ++c) { b[c] = P.elevation[c] - b[c]; var += b[c] * b[c]; }
             float sd = static_cast<float>(std::sqrt(var / N)) + 1e-3f;
+            if (robust) {
+                std::vector<float> t = b;
+                std::nth_element(t.begin(), t.begin() + N * 84 / 100, t.end());
+                float hi = t[N * 84 / 100];
+                std::nth_element(t.begin(), t.begin() + N * 16 / 100, t.end());
+                sd = 0.5f * (hi - t[N * 16 / 100]) + 1e-3f;
+            }
             for (float& v : b) v /= sd;
             return b;
         };
         crest_n = relief_at(3);
         if (P.world.dust > 0.0f) {
-            lows_n = relief_at(30);
+            lows_n = relief_at(30, true);
             // 40-100 km band (no narrow ridges or rims) for the dust edges
-            std::vector<float> fine = relief_at(8);
+            std::vector<float> fine = relief_at(8, true);
             band_n.resize(N);
             for (int c = 0; c < N; ++c) band_n[c] = lows_n[c] - 0.5f * fine[c];
         }
@@ -253,6 +359,19 @@ SurfaceColors surface_albedo(const Planet& P, uint32_t seed) {
     }
     std::vector<float> dust;
     if (P.world.dust > 0.0f && !slope_n.empty()) dust = dust_cover(P, band_n);
+    // Snow drift (WorldSpec::snow_drift): snow stays where the simulated wind laid
+    // it and where snow falls (precipitation); the windiest, driest `bare_ice` of
+    // the area is scoured to bare glacier ice (Antarctica's blue-ice areas; the
+    // sublimation zone of a snowball's dry tropics).
+    std::vector<float> snow;
+    if (!P.snow.empty()) {
+        const int N = g.size();
+        std::vector<float> a = ranks(P.snow), b = ranks(P.precip), sc(N);
+        for (int c = 0; c < N; ++c) sc[c] = 0.6f * a[c] + 0.4f * b[c];
+        std::vector<float> u = ranks(sc);
+        snow.resize(N);
+        for (int c = 0; c < N; ++c) snow[c] = smooth01(P.world.bare_ice - 0.05f, P.world.bare_ice + 0.05f, u[c]);
+    }
     #pragma omp parallel for schedule(static)
     for (int c = 0; c < g.size(); ++c) {
         Vec3 d = g.dir(c);
@@ -260,7 +379,7 @@ SurfaceColors surface_albedo(const Planet& P, uint32_t seed) {
 
         Vec3 sea = mix(ABYSS, SHELF, smooth01(-2500.0f, -150.0f, h));
         float ice = smooth01(-4.0f, -9.0f, t);
-        out.ocean[c] = mix(sea, SEA_ICE, ice);
+        out.ocean[c] = mix(sea, snow.empty() ? SEA_ICE : mix(P.world.blue_ice, SEA_ICE, snow[c]), ice);
         out.warm[c] = smooth01(16.0f, 24.0f, t) * (1.0f - ice);
         // Sandy shores: gentle coastal slope, not frozen, drier = sandier; varies
         // along the shore so beaches alternate with rocky/marshy stretches.
@@ -288,7 +407,8 @@ SurfaceColors surface_albedo(const Planet& P, uint32_t seed) {
         out.land[c] = mix(col, ICE, smooth01(-11.0f, -17.0f, tn));
         if (!P.world.biomes)
             out.land[c] = material_color(P, c, d, off, slope_n[c], crest_n[c], lows_n.empty() ? 0.0f : lows_n[c],
-                                          pole_n.empty() ? 0.0f : pole_n[c], dust.empty() ? 0.0f : dust[c]);
+                                          pole_n.empty() ? 0.0f : pole_n[c], dust.empty() ? 0.0f : dust[c],
+                                          snow.empty() ? 1.0f : snow[c]);
     }
     // River plumes: runoff entering each sea cell, spread a few cells offshore.
     std::vector<float> plume(g.size(), 0.0f);
@@ -314,5 +434,114 @@ SurfaceColors surface_albedo(const Planet& P, uint32_t seed) {
         out.coast_km[c] = (P.elevation[c] > 0.0f ? to_sea[c] : to_land[c]) * EARTH_RADIUS_KM;
     out.mud.resize(g.size());
     for (int c = 0; c < g.size(); ++c) out.mud[c] = 0.7f * smooth01(3e4f, 6e5f, plume[c]);
+
+    // Lava (lava_share per cell, lava_fields): the exposed melt is the youngest
+    // crust. The simulated flow carries crust away from the upwelling plumes and
+    // ages it (crust_age, clouds.cpp): plume heads glow, their tails are drawn out
+    // and folded by the flow, old crust piles up in the gyres; old crust also
+    // breaks into plates along a crack network (`lava_cracks`). By area rank, so
+    // exactly each cell's share glows; the youngest melt is the hottest. Molten
+    // ground and fresh crust are glassy black.
+    if (!P.lava_share.empty()) {
+        const int N = g.size();
+        std::vector<float> young(N);
+        if (!P.crust_age.empty()) {
+            std::vector<float> a = ranks(P.crust_age);
+            for (int c = 0; c < N; ++c) young[c] = 1.0f - a[c];
+        } else {
+            for (int c = 0; c < N; ++c) {
+                Vec3 d = g.dir(c);
+                Vec3 w = Vec3(fbm3r(d * 3.0f + off, 3), fbm3r(d * 3.0f + off * 1.7f, 3), fbm3r(d * 3.0f + off * 2.3f, 3));
+                young[c] = 1.0f - std::min(1.0f, worley_edge(d * 8.0f + w * 1.5f) / 0.5f);
+            }
+        }
+        std::vector<float> score(N);
+        #pragma omp parallel for schedule(static)
+        for (int c = 0; c < N; ++c) {
+            Vec3 d = g.dir(c);
+            Vec3 w = Vec3(fbm3r(d * 3.0f + off, 3), fbm3r(d * 3.0f + off * 1.7f, 3), fbm3r(d * 3.0f + off * 2.3f, 3));
+            float crack = 1.0f - std::min(1.0f, worley_edge(d * 24.0f + w * 3.0f + off) / 0.5f);
+            score[c] = (1.0f - P.world.lava_cracks) * young[c] + P.world.lava_cracks * crack;
+        }
+        std::vector<float> u = ranks(score);
+        out.lava.assign(N, 0.0f);
+        out.lava_k.assign(N, LAVA_K);
+        for (int c = 0; c < N; ++c) {
+            float t = P.temperature[c] + 273.15f, f = P.lava_share[c];
+            if (f <= 0.0f) continue;
+            out.lava[c] = smooth01(1.0f - f - 0.02f, 1.0f - f + 0.02f, u[c]);
+            out.lava_k[c] = std::max(t, 1250.0f + 450.0f * std::clamp((u[c] - (1.0f - f)) / std::max(f, 0.02f), 0.0f, 1.0f));
+            Vec3 crust(0.05f, 0.045f, 0.04f);
+            out.land[c] = mix(out.land[c], crust, smooth01(0.0f, 0.15f, f));
+            out.ocean[c] = mix(out.ocean[c], crust, smooth01(0.0f, 0.15f, f));
+        }
+        // Glow that sets the exposure: its 95th percentile over the area (a few
+        // glowing cracks may saturate, as in a photo; they must not darken the planet).
+        std::vector<float> gl(N);
+        for (int c = 0; c < N; ++c) {
+            Vec3 b = planck_rel(out.lava_k[c]);
+            gl[c] = out.lava[c] * std::max(b.x, std::max(b.y, b.z)) * P.world.thermal;
+        }
+        std::nth_element(gl.begin(), gl.begin() + N * 95 / 100, gl.end());
+        out.lava_peak = gl[N * 95 / 100];
+        // Mineral frost (WorldSpec::mineral_frost): rock vapour (Na, SiO) from the
+        // lava sea blows toward the cold side and condenses where the ground is
+        // cool enough, most near the source; wind streaks radiate from the hot spot.
+        if (P.world.mineral_frost > 0.0f) {
+            std::vector<int> hot;
+            Vec3 axis(0, 0, 0);
+            for (int c = 0; c < N; ++c)
+                if (P.temperature[c] + 273.15f > 1300.0f) { hot.push_back(c); axis = axis + g.dir(c) * g.area(c); }
+            if (!hot.empty()) {
+                axis = normalize(axis);
+                std::vector<float> dist = distance_from(g, hot);
+                Vec3 e1 = normalize(cross(axis, std::fabs(axis.y) < 0.9f ? Vec3(0, 1, 0) : Vec3(1, 0, 0))), e2 = cross(axis, e1);
+                #pragma omp parallel for schedule(static)
+                for (int c = 0; c < N; ++c) {
+                    Vec3 d = g.dir(c);
+                    float t = P.temperature[c] + 273.15f;
+                    float phi = std::atan2(dot(d, e2), dot(d, e1)), th = std::acos(std::clamp(dot(d, axis), -1.0f, 1.0f));
+                    float streak = fbm3r(Vec3(std::cos(phi) * 12.0f, std::sin(phi) * 12.0f, th * 2.0f) + off, 4);
+                    float dep = std::exp(-dist[c] / 0.2f) * smooth01(1150.0f, 950.0f, t) * smooth01(0.3f, 0.65f, streak);
+                    float m = std::min(1.0f, P.world.mineral_frost * 1.5f * dep);
+                    out.land[c] = mix(out.land[c], P.world.mineral, m);
+                }
+            }
+        }
+    }
     return out;
+}
+
+// Molten share of each cell (WorldSpec::lava): from the temperature (the emission
+// balance T^4 = f LAVA_K^4 + (1 - f) CRUST_K^4), at most 85% (a lava lake always
+// carries crust rafts); after a magma ocean has crusted over (`lava_rift`), melt
+// still breaks out along the cracks of the young crust (a warped polygon network
+// ~1/5 of the radius across), but not under open water.
+void lava_fields(Planet& P, uint32_t seed) {
+    const CubeGrid& g = P.grid;
+    const int N = g.size();
+    const Vec3 off(static_cast<float>(seed % 97) * 1.37f, static_cast<float>(seed % 89) * 2.11f,
+                   static_cast<float>(seed % 83) * 0.73f);
+    const float tl4 = std::pow(LAVA_K, 4.0f), tc4 = std::pow(CRUST_K, 4.0f);
+    std::vector<float> rift;
+    if (P.world.lava_rift > 0.0f) {
+        std::vector<float> r(N);
+        #pragma omp parallel for schedule(static)
+        for (int c = 0; c < N; ++c) {
+            Vec3 d = g.dir(c);
+            Vec3 w = Vec3(fbm3r(d * 2.0f + off * 0.6f, 3), fbm3r(d * 2.0f + off * 0.9f, 3), fbm3r(d * 2.0f + off * 1.4f, 3));
+            r[c] = -worley_edge(d * 5.0f + w * 1.2f + off * 0.3f);
+        }
+        rift = ranks(r);
+    }
+    P.lava_share.assign(N, 0.0f);
+    for (int c = 0; c < N; ++c) {
+        float t = P.temperature[c] + 273.15f;
+        float f = 0.85f * std::clamp((t * t * t * t - tc4) / (tl4 - tc4), 0.0f, 1.0f);
+        if (!rift.empty() && !(P.world.ocean && P.elevation[c] <= 0.0f && P.temperature[c] > -4.0f)) {
+            const float lr = P.world.lava_rift;
+            f = std::max(f, 0.85f * smooth01(1.0f - 1.6f * lr, 1.0f - 0.2f * lr, rift[c]));
+        }
+        P.lava_share[c] = f;
+    }
 }

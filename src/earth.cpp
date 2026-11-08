@@ -73,14 +73,14 @@ Vec3 vmul(Vec3 a, Vec3 b) { return Vec3(a.x * b.x, a.y * b.y, a.z * b.z); }
 }  // namespace
 
 Vec3 atmosphere(Vec3 o, Vec3 d, Vec3 base, float t_surface, Vec3 to_sun, Vec3 sun_color,
-                float scale, float haze, const AtmoOptics& opt) {
-    if (!opt.enabled) return base;
+                float scale, float haze, const AtmoOptics& opt, Vec3 emit) {
+    if (!opt.enabled) return base + emit;
     const float hs = scale * opt.height;  // same vertical optical depth at any height
     const Atmo A{1.0f + ATMO_TOP * hs, H_RAYLEIGH * hs, H_MIE * opt.mie_height * hs};
     const Vec3 br = BETA_R * opt.rayleigh / hs;
     const float bm = BETA_M * opt.mie / hs;
     float t0, t1;
-    if (!sphere_span(o, d, A.top, t0, t1) || t1 <= 0.0f) return base;
+    if (!sphere_span(o, d, A.top, t0, t1) || t1 <= 0.0f) return base + emit;
     t0 = std::max(t0, 0.0f);
     bool surface = t_surface > 0.0f;
     if (surface) t1 = t_surface;
@@ -129,7 +129,7 @@ Vec3 atmosphere(Vec3 o, Vec3 d, Vec3 base, float t_surface, Vec3 to_sun, Vec3 su
             base = vmul(base, vexp((br * std::max(0.0f, sr - zr)
                                     + Vec3(1, 1, 1) * (bm * 1.1f * std::max(0.0f, sm - zm))) * -1.0f));
     }
-    return vmul(base, view_t) + inscatter;
+    return vmul(base + emit, view_t) + inscatter;
 }
 
 Ray pixel_ray(const Camera& cam, float x, float y, int w, int h) {

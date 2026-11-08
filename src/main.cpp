@@ -5,11 +5,15 @@
 //            [--palette file.pal | --colors 18 [--plain-palette]] [--raw] [--scale 4]
 //            [--frames N [--orbits 1] [--cloud-minutes 20]]   (disk animation -> <out stem>_frames/;
 //            orbits 0 = fixed camera; weather time per frame, 0 = frozen clouds)
+//            [--spin [--sky-speed 0.05]]  (animation: the sun stays beside the camera = the planet turns
+//                                          under it; the starfield turns at sky-speed x the planet)
 //            [--view leo --frames N [--km-per-frame 1]]      (LEO fly-along; clouds frozen)
 //            [--vibrance 1.3]                                (saturation boost before the palette)
 //   earthgen --planet NAME --describe   (physics "planet card" of a preset; no rendering)
 //            [--star-mass M --orbit-au A --mass M_E --age GYR --day-hours H --volatiles F]  (override inputs)
+//            [--impact-myr T --snowball]  (history: giant impact T Myr ago, frozen-over start)
 //            [--world key=value,...]  (override WorldSpec knobs after the physics, e.g. scarps=2,streaks=0)
+//   earthgen --random N [--describe]     (a new planet from random physical inputs)
 //   earthgen --check-presets            (derived vs real values for every preset)
 #include <chrono>
 #include <cmath>
@@ -19,6 +23,7 @@
 #include <memory>
 #include <string>
 
+#include "color_profile.h"
 #include "earth.h"
 #include "image_io.h"
 #include "maps.h"
@@ -42,8 +47,8 @@ int main(int argc, char** argv) {
     int width = 0, height = 0;  // 0 = per-view default
     float yaw_deg = 0.0f, sun_az = 0.0f;
     int n_frames = 0;
-    float orbits = 1.0f, cloud_minutes = 20.0f, km_per_frame = 1.0f, vibrance = 1.3f;
-    bool raw = false, plain_palette = false, leo = false, describe_only = false, physics_world = false;
+    float orbits = 1.0f, sky_speed = 0.05f, cloud_minutes = 20.0f, km_per_frame = 1.0f, vibrance = 1.3f;
+    bool spin = false, raw = false, plain_palette = false, leo = false, describe_only = false, physics_world = false;
     PhysicalInputs phys;
     std::string world_knobs;  // --world key=value,... (after the physics)
     LeoParams leo_prm;
@@ -66,6 +71,8 @@ int main(int argc, char** argv) {
         else if (a == "--frames") n_frames = std::atoi(next());
         else if (a == "--km-per-frame") km_per_frame = static_cast<float>(std::atof(next()));
         else if (a == "--vibrance") vibrance = static_cast<float>(std::atof(next()));
+        else if (a == "--spin") spin = true;
+        else if (a == "--sky-speed") sky_speed = static_cast<float>(std::atof(next()));
         else if (a == "--orbits") orbits = static_cast<float>(std::atof(next()));
         else if (a == "--cloud-minutes") cloud_minutes = std::max(0.0f, static_cast<float>(std::atof(next())));
         else if (a == "--sun-elev") leo_prm.sun_elev_deg = static_cast<float>(std::atof(next()));
@@ -92,6 +99,12 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--random") {  // a new planet from random physical inputs; also the terrain seed
+            uint32_t seed = static_cast<uint32_t>(std::strtoul(next(), nullptr, 10));
+            phys = random_inputs(seed);
+            prm.seed = seed;
+            physics_world = true;
+        }
         else if (a == "--describe") describe_only = true;
         else if (a == "--world") world_knobs += (world_knobs.empty() ? "" : ",") + std::string(next());  // repeatable
         else if (a == "--star-mass") phys.star_mass = std::atof(next());   // physics inputs: override a preset
@@ -100,6 +113,8 @@ int main(int argc, char** argv) {
         else if (a == "--age") phys.age_gyr = std::atof(next());
         else if (a == "--day-hours") phys.day_hours = std::atof(next());
         else if (a == "--volatiles") phys.volatile_fraction = std::atof(next());
+        else if (a == "--impact-myr") phys.impact_myr_ago = std::atof(next());  // giant impact this long ago
+        else if (a == "--snowball") phys.snowball = true;                       // climate starts frozen over
         else if (a == "--check-presets") { check_presets(); return 0; }
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
@@ -113,7 +128,13 @@ int main(int argc, char** argv) {
     double t0 = now_s();
     Planet planet(prm.grid_n);
     if (physics_world) {  // --planet: the stages build what the physics derives
-        planet.world = world_from_physics(phys, derive(phys), prm);
+        const PlanetPhysics pp = derive(phys);
+        planet.world = world_from_physics(phys, pp, prm);
+        std::fprintf(stderr, "card: %.3g M_E, %.0f km, %.2g x Earth light, %.0f K, %.2g bar, %s, %s%s\n", phys.mass,
+                     pp.radius_km, pp.insolation, pp.t_mean, pp.pressure_bar, pp.liquid.c_str(),
+                     phys.host_mass_kg > 0 ? "moon" : pp.tidally_locked ? "locked" : "planet",
+                     pp.melt > 0 ? (phys.impact_myr_ago >= 0 && phys.impact_myr_ago < phys.age_gyr * 1000 ? ", impact melt" : ", magma ocean")
+                                 : pp.rift > 0 ? ", young crust" : planet.world.lava ? ", lava" : "");
         std::fprintf(stderr, "%s: land %.2f, clouds %.2f%s, craters %.2g\n", phys.name.c_str(), prm.land_fraction,
                      prm.cloud_amount, planet.world.deck ? " (deck)" : "", planet.world.crater_density);
     }
@@ -134,8 +155,10 @@ int main(int argc, char** argv) {
     compute_drainage(planet);
     if (planet.world.lights) place_cities(planet, prm);
     std::fprintf(stderr, "climate %.2fs\n", now_s() - t0);
+    if (planet.world.lava) lava_fields(planet, prm.seed);
     CloudSimPtr weather;
-    if (cloud_image.empty() && prm.cloud_amount <= 0.0f && planet.world.dust <= 0.0f) clear_clouds(planet);
+    if (cloud_image.empty() && prm.cloud_amount <= 0.0f && planet.world.dust <= 0.0f && !planet.world.lava
+        && planet.world.snow_drift <= 0.0f) clear_clouds(planet);
     else if (cloud_image.empty()) weather = start_clouds(planet, prm);
     else if (!load_cloud_image(planet, cloud_image)) {
         std::fprintf(stderr, "could not read %s\n", cloud_image.c_str());
@@ -162,11 +185,20 @@ int main(int argc, char** argv) {
     std::vector<Vec3> relief = relief_normals(planet, view.relief / (wr * wr) * planet.world.shading);
     Scene scene{planet, surf, relief, earth_background(), prm.seed};
 
+    // Colour profile measured on a photo (WorldSpec::color_profile; disk view):
+    // the render keeps its structure, the photo gives the colour distribution.
+    ColorProfile profile;
+    if (!leo && !planet.world.color_profile.empty()) {
+        std::string exe_dir = std::filesystem::path(argv[0]).parent_path().string();
+        if (!profile.load(planet.world.color_profile) && !profile.load(exe_dir + "/../" + planet.world.color_profile))
+            std::fprintf(stderr, "could not read colour profile %s (colours stay as modelled)\n", planet.world.color_profile.c_str());
+    }
+
     struct Frame {
         std::vector<uint32_t> px;
         std::vector<Seen> seen;
     };
-    auto render_frame = [&](const View& v) {
+    auto render_pass = [&](const View& v) {
         Frame f{std::vector<uint32_t>(static_cast<size_t>(W) * H), std::vector<Seen>(static_cast<size_t>(W) * H)};
         #pragma omp parallel for schedule(dynamic, 4)
         for (int y = 0; y < H; ++y)
@@ -180,8 +212,14 @@ int main(int argc, char** argv) {
                 f.px[i] = pack_rgba(sum / static_cast<float>(ss * ss));
                 f.seen[i] = shade(scene, v, pixel_ray(v.cam, x + 0.5f, y + 0.5f, W, H)).what;
             }
+        return f;
+    };
+    auto render_frame = [&](const View& v) {
+        Frame f = render_pass(v);
         // Camera-like exposure (lifeless worlds): the lit planet's 95th-percentile
-        // luma -> world.auto_p95, applied before the grade.
+        // luma -> world.auto_p95, applied before the grade, as a gain on the rays
+        // that hit the planet in a second pass (scaling finished pixels also
+        // brightened the stars blended into limb pixels: dotted rims).
         if (planet.world.auto_p95 > 0.0f) {
             std::vector<float> lum;
             for (size_t i = 0; i < f.px.size(); ++i)
@@ -192,15 +230,25 @@ int main(int argc, char** argv) {
             if (lum.size() > 16) {
                 std::nth_element(lum.begin(), lum.begin() + lum.size() * 95 / 100, lum.end());
                 float k = planet.world.auto_p95 / std::max(0.02f, lum[lum.size() * 95 / 100]);
-                for (size_t i = 0; i < f.px.size(); ++i)
-                    if (f.seen[i] != Seen::Space) {
-                        uint32_t p = f.px[i];
-                        f.px[i] = pack_rgba(Vec3((p & 255) / 255.0f, ((p >> 8) & 255) / 255.0f, ((p >> 16) & 255) / 255.0f) * k);
-                    }
+                if (std::getenv("EXPOSURE_DEBUG")) std::fprintf(stderr, "auto exposure x%.2f\n", k);
+                View vg = v;
+                vg.gain = k;
+                f = render_pass(vg);
             }
         }
-        // Grade: more saturation everywhere before the palette crush (--vibrance).
-        if (!raw)
+        if (profile.bands > 0) {  // photo colours on the planet (statistics inside 0.7 R: the photo's limb is washed out)
+            std::vector<bool> on(f.px.size()), inner(f.px.size());
+            const float cx = 0.5f * W, cy = 0.5f * H, R = 0.5f * PLANET_FRAC * W;
+            for (size_t i = 0; i < f.px.size(); ++i) {
+                float dx = (i % W) + 0.5f - cx, dy = (i / W) + 0.5f - cy;
+                on[i] = f.seen[i] != Seen::Space;
+                inner[i] = on[i] && std::hypot(dx, dy) < 0.7f * R;
+            }
+            profile.apply(f.px, on, inner);
+        }
+        // Grade: more saturation everywhere before the palette crush (--vibrance);
+        // not on photo-profile or physical (true) colours.
+        if (!raw && profile.bands == 0 && !planet.world.true_color)
             for (uint32_t& p : f.px) {
                 Vec3 c((p & 255) / 255.0f, ((p >> 8) & 255) / 255.0f, ((p >> 16) & 255) / 255.0f);
                 float l = 0.299f * c.x + 0.587f * c.y + 0.114f * c.z;
@@ -225,7 +273,9 @@ int main(int argc, char** argv) {
             // The weather keeps running: clouds drift, grow, decay and change.
             if (weather && cloud_minutes > 0.0f) advance_clouds(*weather, planet, f == 0 ? 0.0f : cloud_minutes);
             float yaw = yaw_deg + 360.0f * orbits * f / n_frames;
-            frames.push_back(render_frame(disk_view(W, yaw, sun_az - (yaw - yaw_deg))));  // sun fixed in space
+            View fv = disk_view(W, yaw, spin ? sun_az : sun_az - (yaw - yaw_deg));  // else sun fixed in space
+            if (spin) fv.sky_turn = (1.0f - sky_speed) * (yaw - yaw_deg) * 0.017453293f;
+            frames.push_back(render_frame(fv));
         }
     }
     std::fprintf(stderr, "render %.2fs (%zu frame%s)\n", now_s() - t0, frames.size(), frames.size() > 1 ? "s" : "");

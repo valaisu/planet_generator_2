@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <random>
 
 namespace {
 
@@ -18,6 +19,12 @@ constexpr double M_SUN = 1.989e30, M_EARTH = 5.972e24, R_EARTH = 6.371e6, AU = 1
 constexpr double GYR = 3.156e16, S_EARTH = 1361.0;
 
 double clamp01(double x) { return std::clamp(x, 0.0, 1.0); }
+// Molten rock radiates at ~1500 K; the surface brightness temperature at which lava
+// shows (crust cracks) is CRUST_K (planet.h, shared with the renderer).
+constexpr double T_LAVA = LAVA_K;
+// CO2 in the air of a snowball: the ocean froze with its CO2 in carbonate rock;
+// volcanoes add it back over ~10 Myr until the ice melts (~0.1 bar for Earth).
+constexpr double SNOWBALL_CO2 = 2e-3;
 
 // --- Phase diagrams -----------------------------------------------------------
 // Clausius-Clapeyron from the triple point with constant latent heats (sublimation
@@ -179,6 +186,24 @@ PlanetPhysics derive(const PhysicalInputs& in) {
     p.heat_flux_wm2 = radiogenic * (1.0 + std::min(radius / R_EARTH, 1.5)) / area + p.tidal_heat_wm2;
     const double q = p.heat_flux_wm2;
 
+    // --- Formation / impact heat: a magma ocean ---------------------------------
+    // Accretion and giant impacts melt the surface. The magma ocean radiates until
+    // a crust closes over it: ~1 Myr dry, a few Myr with Earth's water, ~30x longer
+    // under a steam atmosphere that can't cool inside the runaway limit (Elkins-
+    // Tanton 2008; Hamano et al. 2013). The molten share falls ~linearly; its
+    // radiation enters the climate (icy bodies: no silicate melt at the surface).
+    p.melt_myr = age * 1000.0;
+    if (in.impact_myr_ago >= 0) p.melt_myr = std::min(p.melt_myr, in.impact_myr_ago);
+    const double water_rel = std::min(1.0, w / 2.3e-4);
+    p.magma_tau_myr = icy ? 0.0 : (1.0 + 3.0 * water_rel) * (water_rel > 0.1 && p.insolation > 1.1 ? 30.0 : 1.0);
+    p.melt = p.magma_tau_myr > 0 ? clamp01(1.0 - p.melt_myr / p.magma_tau_myr) : 0.0;
+    const double q_magma = p.melt * SIGMA * std::pow(T_LAVA, 4);
+    // Once the crust has closed it thickens ~sqrt(t) and the melt beneath keeps
+    // breaking out along its cracks for a few closing times (fading; a guess at
+    // ~5% of the surface at first). Its heat no longer matters for the climate.
+    if (p.magma_tau_myr > 0 && p.melt <= 0)
+        p.rift = 0.05 * clamp01(1.0 - (p.melt_myr - p.magma_tau_myr) / (3.0 * p.magma_tau_myr));
+
     // --- Volatile inventories (as surface pressure if all were gas) -------------
     // Rocky: per kg of water, 0.33 kg CO2 (Earth's carbonates ~ Venus' air) and
     // 0.003 kg N2 (Earth's air). Icy: N2 1.5e-4 (Titan's air, from NH3) and CH4
@@ -220,7 +245,7 @@ PlanetPhysics derive(const PhysicalInputs& in) {
     struct State {
         double t, p_co2, p_n2, p_ch4, p_h2o, p_o2, pressure;
         double albedo, eta, d_t, ocean_frac, ice_frac;
-        bool ocean, weathering, life, deck, haze, dust;
+        bool ocean, frozen, weathering, life, deck, haze, dust;
         double co2_cond, n2_cond, ch4_cond;   // condensed parts (bar)
         double tau;
     };
@@ -230,6 +255,8 @@ PlanetPhysics derive(const PhysicalInputs& in) {
     State s{};
     double p_last = 0, tau_last = 0;  // previous iteration's pressure and opacity (set the redistribution)
     double hadley_rad = 0;
+    double q_extra = 0;          // magma ocean radiation (the epoch being run)
+    bool snowball_now = false;   // this run starts frozen and keeps the CO2 in rock
 
     // Everything at a given mean temperature (and CO2 pressure if weathering sets
     // it); returns the new surface temperature.
@@ -241,7 +268,7 @@ PlanetPhysics derive(const PhysicalInputs& in) {
         // fitted to Earth's ~46 K equator-pole contrast).
         double tau_rad = p_last * 1e5 * 1000.0 / (4.0 * p.gravity * SIGMA * std::pow(t_mean, 3)) * (1.0 + tau_last);
         st.eta = tau_rad / (tau_rad + 27.0 * radius / 15.0);
-        st.d_t = t_mean * d_rad * (1.0 - st.eta);
+        st.d_t = t_mean * d_rad * (1.0 - st.eta) * std::clamp(1.0 - q_extra / (SIGMA * std::pow(t_mean, 4)), 0.0, 1.0);  // sunlit share
         double t_eqr = t_mean + st.d_t / 3.0, t_pol = t_mean - 2.0 * st.d_t / 3.0;
         double t_cold = std::max(std::min(t_eqr, t_pol), 20.0);
 
@@ -265,8 +292,9 @@ PlanetPhysics derive(const PhysicalInputs& in) {
         double gel = icy ? 0.0 : water_kg * water_lost / (1000.0 * area);
         double p_guess = st.p_n2 + co2_gas + st.p_ch4;
         st.ocean = gel > 1.0 && t_eqr > 271.0 && p_guess > H2O.p_triple && p_sat(H2O, t_mean) < std::max(p_guess, 0.01);
+        st.frozen = snowball_now && gel > 1.0 && !st.ocean && t_eqr <= 271.0;  // ocean frozen over
         double h0 = 1100.0 * std::sqrt(9.81 / p.gravity);  // hypsometry: Earth's 2.7 km -> 71% ocean
-        st.ocean_frac = st.ocean ? gel / (gel + h0) : 0.0;
+        st.ocean_frac = st.ocean || st.frozen ? gel / (gel + h0) : 0.0;
         double h2o_inv = icy ? 0.0 : column_bar(water_kg * water_lost);
         st.p_h2o = std::min(0.6 * p_sat(H2O, t_mean), h2o_inv);
 
@@ -277,13 +305,14 @@ PlanetPhysics derive(const PhysicalInputs& in) {
             double s2 = (t_mean + st.d_t / 3.0 - 263.0) / st.d_t;  // sin^2(lat) of the ice edge
             cold_area = s2 <= 0 ? 1.0 : s2 >= 1 ? 0.0 : 1.0 - std::sqrt(s2);
         } else cold_area = t_mean < 263.0 ? 1.0 : 0.0;
-        st.ice_frac = icy ? 1.0 : st.ocean ? cold_area : std::min(cold_area, gel / 3000.0);
+        st.ice_frac = icy ? 1.0 : st.ocean || st.frozen ? cold_area : std::min(cold_area, gel / 3000.0);
 
         // Carbonate-silicate thermostat: needs liquid water on a geologically
         // active body; CO2 is then whatever keeps ~288 K (Earth's set point).
         bool can_plate = in.regime == Regime::Auto || in.regime == Regime::PlateTectonics;
         st.weathering = st.ocean && can_plate && in.mass > 0.3 && q > 0.04;
-        st.p_co2 = st.weathering ? (co2_override > 0 ? co2_override : co2_gas) : co2_gas;
+        st.p_co2 = st.weathering ? (co2_override > 0 ? co2_override : co2_gas)
+                 : st.frozen ? std::min(co2_gas, SNOWBALL_CO2) : co2_gas;
 
         st.life = in.life == Tristate::Yes ||
                   (in.life == Tristate::Auto && st.ocean && t_eqr > 273.0 && t_eqr < 330.0 && age > 0.8);
@@ -292,9 +321,10 @@ PlanetPhysics derive(const PhysicalInputs& in) {
 
         // Aerosols that set the albedo.
         double volc = std::max(0.0, q - 0.015) / 0.065;
-        st.deck = !st.ocean && st.pressure > 10.0 && volc > 0.2 && st.p_h2o > 1e-5;   // H2SO4 (Venus)
+        st.deck = !st.ocean && !st.frozen && st.pressure > 10.0 && volc > 0.2 && st.p_h2o > 1e-5;  // H2SO4 (Venus)
         st.haze = st.p_ch4 > 1e-3 && st.p_n2 > 0.1;                                  // thick tholin haze (Titan)
-        st.dust = !icy && !st.ocean && st.pressure > 1e-3 && st.pressure < 0.1;       // dust (Mars)
+        st.dust = !icy && !st.ocean && st.pressure > 1e-3 && st.pressure < 0.1        // dust (Mars), needs
+                  && st.ice_frac < 0.9;                                                // bare ground to lift
 
         // Albedo by surface material (+ clouds), measured values of each kind.
         double a_ice = 0.68;
@@ -319,15 +349,15 @@ PlanetPhysics derive(const PhysicalInputs& in) {
         double tau_cia = 0.48 * (st.p_n2 + st.p_ch4) * st.pressure / p.gravity * std::pow(94.0 / std::max(t_mean, 94.0), 2);
         st.tau = tau_co2 + tau_h2o + tau_cia;
         double t_eq4 = S_EARTH * insol * (1.0 - st.albedo) / (4.0 * SIGMA);
-        return std::pow(t_eq4 * (1.0 + 0.75 * st.tau) + q / SIGMA, 0.25);
+        return std::pow(t_eq4 * (1.0 + 0.75 * st.tau) + (q + q_extra) / SIGMA, 0.25);
     };
 
     // The climate depends on history (CO2 in rock or in the air; a collapsed or a
     // thick atmosphere on a locked planet). Each run starts from an Earth-like
     // greenhouse, either with the ocean condensed and its CO2 in carbonates or
     // with every gas in the air.
-    auto run_climate = [&](bool carbonate_start) {
-    t = 278.6 * std::pow(insol * 0.7, 0.25) * std::pow(1.626, 0.25);
+    auto run_climate = [&](bool carbonate_start, bool frozen_start = false) {
+    t = frozen_start ? 200.0 : 278.6 * std::pow(insol * 0.7, 0.25) * std::pow(1.626, 0.25);
     p_last = (inv_n2 + (carbonate_start ? 0.0 : inv_co2)) * keep_gas;
     tau_last = 0;
     for (int it = 0; it < 200; ++it) {
@@ -344,7 +374,8 @@ PlanetPhysics derive(const PhysicalInputs& in) {
         }
         // Runaway greenhouse: the ocean boils into the air, where UV splits it and
         // the hydrogen escapes within ~0.5 Gyr (Venus kept ~1e-5 of its water).
-        if (!icy && !runaway && water_kg > 0 && t_new > 500.0) {
+        // (Not a magma ocean's heat: its steam rains out again once a crust forms.)
+        if (!icy && !runaway && water_kg > 0 && t_new > 500.0 && q_extra == 0) {
             runaway = true;
             if (age > 0.5) water_lost = 1e-5;
         }
@@ -360,20 +391,33 @@ PlanetPhysics derive(const PhysicalInputs& in) {
     };
     // 1. The young system (0.5 Gyr, fainter star, still spinning unless it locks
     //    faster): does the ocean condense, or run away and lose its water?
+    bool young_ocean = false;
     if (water_kg > 0 && !icy) {
         insol = lum_at(std::min(0.5, age)) / (in.orbit_au * in.orbit_au);
         d_rad = p.lock_time_gyr < 0.5 && !moon ? d_rad_locked : d_rad_spin;
+        q_extra = age <= 0.5 ? q_magma : 0.0;
         run_climate(true);
+        young_ocean = s.ocean;
         insol = p.insolation;
         d_rad = locked_to_star ? d_rad_locked : d_rad_spin;
     }
     // 2. Today: CO2 in rock if there is still water, else in the air; if the
     //    ocean doesn't survive, CO2 builds up in the air again (no weathering).
-    run_climate(water_kg * water_lost > 0 && !runaway);
-    if (!s.ocean && water_kg * water_lost > 0 && !runaway) run_climate(false);
+    //    A snowball start keeps the ocean frozen only where that state is stable.
+    q_extra = q_magma;
+    if (in.snowball && young_ocean && water_kg * water_lost > 0 && !runaway) {  // (an ocean that froze)
+        snowball_now = true;
+        run_climate(true, true);
+        snowball_now = s.frozen;
+    }
+    if (!snowball_now) {
+        run_climate(water_kg * water_lost > 0 && !runaway);
+        if (!s.ocean && water_kg * water_lost > 0 && !runaway) run_climate(false);
+    }
 
     // --- Climate outputs ----------------------------------------------------------
     p.runaway = runaway;
+    p.snowball = s.frozen;
     p.albedo = s.albedo;
     p.t_eq = 278.6 * std::pow(p.insolation * (1.0 - s.albedo), 0.25);
     p.t_mean = t;
@@ -431,6 +475,7 @@ PlanetPhysics derive(const PhysicalInputs& in) {
         double gel = water_kg * water_lost / (1000.0 * area);
         Volatile v{"H2O", column_bar(water_kg * water_lost), s.p_h2o, ""};
         v.state = s.ocean ? (s.ice_frac > 0 ? "liquid ocean + polar ice" : "liquid ocean")
+                : s.frozen ? "ocean frozen over (snowball)"
                 : runaway ? "vapour remnant (ocean lost to a runaway greenhouse)"
                 : s.ice_frac > 0.5 ? "ice (global)" : s.ice_frac > 0 ? "ice" + cold_place : "vapour";
         p.ocean_depth_m = gel;
@@ -447,6 +492,7 @@ PlanetPhysics derive(const PhysicalInputs& in) {
     p.ice_fraction = s.ice_frac;
     p.ocean_fraction = s.ocean_frac;
     if (s.ocean) { p.liquid = "water"; p.ocean_colour = p.life ? "deep blue, green where life blooms" : "deep blue"; }
+    else if (s.frozen) { p.liquid = "water (frozen over)"; p.ocean_colour = "sea ice"; }
     else if (s.ch4_cond > 0 && t_warm > CH4.t_triple) {
         // Condensed methane beyond the vapour pressure pools in lowlands.
         double gel = s.ch4_cond * 1e5 / p.gravity / 450.0;
@@ -462,6 +508,7 @@ PlanetPhysics derive(const PhysicalInputs& in) {
     else if (p.tidal_heat_wm2 > 1.0) p.regime = Regime::HeatPipe;
     else if (q < 0.015) p.regime = Regime::Dead;
     else if (s.weathering) p.regime = Regime::PlateTectonics;  // liquid water weakens the lithosphere
+    else if (s.frozen && in.mass > 0.3 && q > 0.04) p.regime = Regime::PlateTectonics;  // (still liquid under the ice)
     else p.regime = Regime::StagnantLid;
 
     double volc = std::max(0.0, q - 0.015) / 0.065;  // Earth ~1
@@ -482,7 +529,7 @@ PlanetPhysics derive(const PhysicalInputs& in) {
     else if (p.regime == Regime::StagnantLid && p.volcanism > 0) surf = 0.25 / p.volcanism;
     bool erosion = (s.ocean || p.liquid != "none") && s.pressure > 0.01;
     if (erosion) surf = std::min(surf, 1.0);
-    p.surface_age_gyr = std::max(0.0, std::min(surf, age - 0.5));
+    p.surface_age_gyr = std::max(0.0, std::min({surf, age - 0.5, p.melt_myr / 1000.0}));  // a magma ocean erases all
     // Impact flux falls off outside the inner system (fewer, slower impactors in
     // the Kuiper belt; ~(a / 1.5 AU)^-0.5, a guess).
     double flux = std::min(1.0, std::pow(in.orbit_au / 1.5, -0.5));
@@ -509,11 +556,21 @@ PlanetPhysics derive(const PhysicalInputs& in) {
             : p.regime == Regime::PlateTectonics ? "strong (Earth-like)" : "weak (large core)";
 
     // --- Clouds and aerosols --------------------------------------------------------
-    if (s.deck) { p.aerosols.push_back("sulfuric acid cloud deck (pale yellow)"); p.cloud_amount = 1.0; }
+    if (s.deck) {  // a steam atmosphere (over a magma ocean) condenses into water clouds aloft
+        p.aerosols.push_back(s.p_h2o > 0.5 * s.pressure ? "water cloud deck over a steam atmosphere"
+                                                         : "sulfuric acid cloud deck (pale yellow)");
+        p.cloud_amount = 1.0;
+    }
     if (s.haze) { p.aerosols.push_back("thick orange tholin haze"); p.cloud_amount = 1.0; }
     else if (s.p_ch4 > 0 && s.p_n2 > 0) p.aerosols.push_back("thin blue tholin haze layers");
     if (s.dust) p.aerosols.push_back("suspended dust (butterscotch sky)");
     if (s.ocean) { p.cloud_types.push_back("water"); p.cloud_amount = std::max(p.cloud_amount, 0.24); }
+    // Steam too thin for a deck over ground too hot for an ocean still condenses
+    // aloft (convective clouds; more steam, more cloud — a guess).
+    if (!s.deck && !s.ocean && !s.frozen && s.t > 373.0 && s.p_h2o > 0.01) {
+        p.cloud_types.push_back("water (convective, over hot ground)");
+        p.cloud_amount = std::max(p.cloud_amount, std::clamp(0.25 + 0.15 * std::log10(s.p_h2o), 0.1, 0.7));
+    }
     if (p.liquid.rfind("methane", 0) == 0) { p.cloud_types.push_back("methane (sparse)"); p.cloud_amount = std::max(p.cloud_amount, 0.03); }
     if (s.dust && p.ocean_depth_m > 0) { p.cloud_types.push_back("thin water/CO2 ice"); p.cloud_amount = std::max(p.cloud_amount, 0.02); }
 
@@ -552,19 +609,44 @@ PlanetPhysics derive(const PhysicalInputs& in) {
         else p.materials.push_back("basalt");
         if (airless) p.materials.push_back("space-weathered regolith (dark grey)");
         if (airless && p.crater_density > 0.5) p.materials.push_back("bright rays of young craters");
-        if (w > 1e-6 && t < 500 && !airless) p.materials.push_back(p.oxygen ? "soils, iron oxides in deserts" : "iron-oxide dust (rust)");
+        // Iron rusts with liquid water (an early ocean) or with the oxidants left
+        // when UV splits water vapour and the hydrogen escapes (Mars); a world whose
+        // water was always frozen out of the air stays basalt.
+        const bool oxidised = young_ocean || s.ocean || s.p_h2o > 1e-7;
+        if (w > 1e-6 && t < 500 && !airless && oxidised && s.ice_frac < 0.99) {  // (not seen under global ice)
+            // How far: an ocean (then or now) oxidises the iron fully; vapour alone by
+            // the oxidants its photolysis leaves (H escapes), so by vapour x time: Mars'
+            // 6e-6 bar over 4.6 Gyr rusted its dust fully, 1e-7 bar for 0.5 Gyr leaves
+            // it grey-brown (full from 1e-5 bar Gyr, 0.25 at 1e-8). Which oxide:
+            // with liquid water today goethite (ochre) forms; dry or hot (> ~350 K,
+            // goethite dehydrates) it is hematite (Mars' red dust is dry UV oxidation,
+            // whatever water came before).
+            p.rust_ox = young_ocean || s.ocean ? 1.0
+                      : std::clamp(0.25 + 0.25 * (std::log10(std::max(s.p_h2o * age, 1e-15)) + 8.0), 0.25, 1.0);
+            p.rust_wet = s.ocean ? std::clamp((400.0 - t) / 50.0, 0.0, 1.0) : 0.0;
+            const char* kind = p.rust_ox < 0.7 ? "weakly oxidised, grey-brown" : p.rust_wet > 0.5 ? "goethite, ochre" : "hematite, red";
+            p.materials.push_back(p.oxygen ? std::string("soils, iron oxides in deserts")
+                                           : std::string("iron-oxide dust (rust: ") + kind + ")");
+        }
         if (s.ocean) p.materials.push_back("salt flats in arid basins");
         if (s.dust || (s.ocean && s.pressure > 0.1)) p.materials.push_back("sand dunes");
         if (p.life) p.materials.push_back("vegetation");
         if (s.ice_frac > 0) p.materials.push_back("water ice");
         if (!s.weathering && (s.co2_cond > 0 || (s.p_co2 > 0 && s.p_co2 > p_sat(CO2, p.t_winter_pole)))) p.materials.push_back("CO2 frost");
-        if (q > 0.3 || t > 1000) p.materials.push_back("glowing lava");
+        if (q > 0.3 || t > 1000 || p.melt > 0) p.materials.push_back("glowing lava");
     }
     return p;
 }
 
 void describe(const PhysicalInputs& in, const PlanetPhysics& p) {
     std::printf("=== %s ===\n", in.name.c_str());
+    // Machine-readable inputs (tools/prefs.py: generation parameters -> preference)
+    std::printf("inputs     star_mass=%.6g age_gyr=%.6g orbit_au=%.6g mass=%.6g composition=%d volatiles=%.6g "
+                "day_hours=%.6g obliquity=%.6g moons=%d moon_mass_ratio=%.6g host_mass_kg=%.6g host_km=%.6g "
+                "impact_myr=%.6g snowball=%d\n",
+                in.star_mass, in.age_gyr, in.orbit_au, in.mass, static_cast<int>(in.composition), in.volatile_fraction,
+                in.day_hours, in.obliquity_deg, in.moons, in.moon_mass_ratio, in.host_mass_kg, in.host_distance_km,
+                in.impact_myr_ago, in.snowball ? 1 : 0);
     std::printf("star       %.2f Msun, L %.3f Lsun, Teff %.0f K (rgb %.2f %.2f %.2f), lifetime %.1f Gyr%s\n",
                 in.star_mass, p.star_lum, p.star_teff, p.star_rgb[0], p.star_rgb[1], p.star_rgb[2],
                 p.star_lifetime_gyr, in.age_gyr > p.star_lifetime_gyr ? "  [star has left the main sequence!]" : "");
@@ -576,6 +658,13 @@ void describe(const PhysicalInputs& in, const PlanetPhysics& p) {
                 p.tidally_locked ? " TIDALLY LOCKED" : "", p.lock_time_gyr, in.obliquity_deg);
     std::printf("interior   heat flow %.3g W/m2 (tidal %.3g) -> %s, volcanism %.2f x Earth (%s)\n",
                 p.heat_flux_wm2, p.tidal_heat_wm2, regime_name(p.regime), p.volcanism, p.volcanism_type.c_str());
+    if (p.rift > 0)
+        std::printf("           young crust over a magma ocean (closed %.3g Myr ago): %.1f%% molten along cracks\n",
+                    p.melt_myr - p.magma_tau_myr, 100 * p.rift);
+    if (p.melt > 0)
+        std::printf("           magma ocean (%s %.3g Myr ago): %.0f%% still molten, crust closes in ~%.2g Myr\n",
+                    in.impact_myr_ago >= 0 && in.impact_myr_ago < in.age_gyr * 1000.0 ? "giant impact" : "formed",
+                    p.melt_myr, 100 * p.melt, p.magma_tau_myr);
     std::printf("           field: %s; surface age %.3g Gyr, craters %.3g x lunar maria\n", p.field.c_str(),
                 p.surface_age_gyr, p.crater_density);
     std::printf("           relief up to ~%.0f km, %s", p.max_relief_km, p.hypsometry.c_str());
@@ -633,7 +722,7 @@ WorldSpec world_from_physics(const PhysicalInputs& in, const PlanetPhysics& p, P
         case Regime::Dead: w.style = TerrainStyle::Dead; break;
         default: w.style = TerrainStyle::IceShell;
     }
-    w.ocean = p.liquid == "water";
+    w.ocean = p.liquid.rfind("water", 0) == 0;  // (a frozen-over ocean too: the climate puts sea ice on it)
     prm.land_fraction = w.ocean ? static_cast<float>(1.0 - p.ocean_fraction) : 1.0f;
     w.relief = static_cast<float>(p.max_relief_km / 20.0 * EARTH_RADIUS_KM / p.radius_km);
     w.volcanism = static_cast<float>(p.volcanism);
@@ -645,7 +734,8 @@ WorldSpec world_from_physics(const PhysicalInputs& in, const PlanetPhysics& p, P
     // keep only craters younger than themselves.
     {
         double flux = std::min(1.0, std::pow(in.orbit_au / 1.5, -0.5));
-        double old_density = std::min(neukum(std::max(0.0, in.age_gyr - 0.5)) / neukum(3.5) * flux, 10.0);
+        double oldest = std::min(in.age_gyr - 0.5, p.melt_myr / 1000.0);  // (a magma ocean erases the record)
+        double old_density = std::min(neukum(std::max(0.0, oldest)) / neukum(3.5) * flux, 10.0);
         old_density = std::max(old_density, p.crater_density);
         w.crater_density = w.style == TerrainStyle::Plates ? 0.0f : static_cast<float>(old_density);
         // (plains are at least ~0.3 Gyr younger than the average surface)
@@ -655,8 +745,8 @@ WorldSpec world_from_physics(const PhysicalInputs& in, const PlanetPhysics& p, P
     w.erosion = w.ocean;
     w.radius_km = static_cast<float>(p.radius_km);
     // Ice flows over Gyr (viscous relaxation) and volatile frost blankets
-    // relief: craters on icy bodies stay shallow.
-    if (icy) w.crater_relief = 0.35f;
+    // relief: craters on icy bodies stay shallower.
+    if (icy) w.crater_relief *= 0.85f;
 
     // Climate: shift Earth's curve (ocean worlds) or the physics' P2 profile.
     w.t_offset = static_cast<float>(p.t_mean - 288.0);
@@ -679,9 +769,13 @@ WorldSpec world_from_physics(const PhysicalInputs& in, const PlanetPhysics& p, P
     w.optics.rayleigh = static_cast<float>(std::min(p.rayleigh_tau[1] / 0.0935, 3.0));
     w.optics.height = static_cast<float>((p.scale_height_km / p.radius_km) / (8.5 / 6371.0));
     w.optics.mie = static_cast<float>(std::clamp(p.pressure_bar, 0.3, 2.0));
-    if (has(p.aerosols, "dust")) {  // well-mixed dust, less forward-peaked than Earth's haze (g ~0.6)
+    if (has(p.aerosols, "dust")) {
+        // Dust is forward-scattering (g ~0.6), but it scatters many times, which
+        // single scattering misses: a flatter phase and 1.5x the haze over the
+        // ground stand in for it. The glow off the limb stays thin (photos show
+        // none; the exaggerated shell read as an unnaturally thick atmosphere).
         w.optics.mie = 2.0f; w.optics.mie_albedo = Vec3(1.0f, 0.72f, 0.45f);
-        w.optics.mie_g = 0.6f; w.optics.mie_height = 1.0f;
+        w.optics.mie_g = 0.2f; w.optics.haze = 1.5f; w.optics.rim = 0.3f;
     }
     if (has(p.aerosols, "tholin haze")) { w.optics.mie = 2.0f; w.optics.mie_albedo = Vec3(1.0f, 0.70f, 0.35f); }
     if (has(p.aerosols, "sulfuric")) { w.optics.mie = 2.0f; w.optics.mie_albedo = Vec3(1.0f, 0.97f, 0.90f); }
@@ -693,6 +787,11 @@ WorldSpec world_from_physics(const PhysicalInputs& in, const PlanetPhysics& p, P
         w.deck_light = Vec3(0.92f, 0.91f, 0.90f);   // near-neutral whites (photos), faint warm
         w.deck_dark = Vec3(0.79f, 0.76f, 0.72f);
         w.deck_texture = 2.0f;  // convective sulfuric clouds: streaks/swirls (tools/tune.py)
+    } else if (has(p.aerosols, "steam atmosphere")) {
+        w.deck = true;
+        w.deck_light = Vec3(0.94f, 0.94f, 0.95f);  // water cloud tops: white
+        w.deck_dark = Vec3(0.80f, 0.81f, 0.84f);
+        w.deck_texture = 2.0f;  // convective, like Venus' deck
     } else if (has(p.aerosols, "thick orange tholin haze")) {
         w.deck = true;
         w.deck_light = Vec3(0.91f, 0.80f, 0.51f);  // (vibrance-compensated photo colours)
@@ -718,7 +817,8 @@ WorldSpec world_from_physics(const PhysicalInputs& in, const PlanetPhysics& p, P
         w.dark = Vec3(0.66f, 0.62f, 0.56f);
         w.bright = Vec3(0.92f, 0.92f, 0.90f);
         w.dark_amount = 0.1f;
-        if (has(p.materials, "salts")) { w.stain = Vec3(0.56f, 0.44f, 0.32f); w.stain_amount = 0.55f; }
+        const bool brine = has(p.materials, "salts") || has(p.materials, "brine");
+        if (brine) { w.stain = Vec3(0.56f, 0.44f, 0.32f); w.stain_amount = 0.68f; }  // red-brown share of europa.jpg (30 %)
         w.alt = Vec3(0.60f, 0.66f, 0.58f);     // grey-green ice (older, radiation-processed)
         if (has(p.materials, "tholins")) {
             w.rock = Vec3(0.80f, 0.76f, 0.69f);
@@ -726,6 +826,54 @@ WorldSpec world_from_physics(const PhysicalInputs& in, const PlanetPhysics& p, P
             w.stain_amount = 0.9f;  // tools/tune.py vs 3 photos
         }
         w.ice = Vec3(0.94f, 0.90f, 0.82f);     // N2 / CH4 ice
+        // Physical colour model (WorldSpec::absorber_floor): clean ice + an absorber
+        // column from the processes. Material constants: clean fine-grained ice is
+        // faintly blue (water ice absorbs a little red); tholin and radiolysed
+        // sulfur salts absorb blue most, saturating at their own dark colour
+        // (fitted to the New Horizons / Galileo true-colour photos).
+        const bool tholins = has(p.materials, "tholins"), lag = has(p.materials, "dark lag");
+        if (tholins || brine || lag) {
+            w.true_color = true;
+            w.ice_clean = Vec3(0.95f, 0.95f, 0.96f);
+            if (tholins) {  // haze fallout (CH4 photolysis) over Gyr on exposed ground
+                w.absorber_k = Vec3(1.0f, 1.6f, 2.4f);
+                w.absorber_floor = Vec3(0.24f, 0.17f, 0.11f);
+                w.fallout = has(p.aerosols, "tholin haze") ? static_cast<float>(3.0 * std::min(1.0, p.surface_age_gyr / 4.0)) : 0.0f;
+                // Volatiles leave the latitudes that get the most sun over the
+                // seasons; at high obliquity that is the band inside the arctic
+                // circles (90 - obliquity, folded: Pluto ~30 deg).
+                double ob = std::min(in.obliquity_deg, 180.0 - in.obliquity_deg);
+                w.volatile_band = static_cast<float>(90.0 - ob);
+                // Without a haze, CH4 ice reddens in place (UV, cosmic rays: tholins
+                // over ~Gyr, the red of Charon's pole and of old Kuiper-belt surfaces).
+                if (w.fallout == 0.0f) w.weathering = static_cast<float>(std::min(1.0, p.surface_age_gyr / 2.0));
+                if (brine && w.cracks) w.brine = 1.3f;  // erupted salts stain chaos and lineae too (same absorber family)
+            } else if (brine) {  // sulfur salts: implanted plasma + endogenic brine
+                w.ice_clean = Vec3(0.86f, 0.89f, 0.93f);
+                w.coarse_ice = Vec3(0.20f, 0.12f, 0.05f);  // water-ice surface
+                w.absorber_k = Vec3(1.0f, 1.4f, 2.0f);
+                w.absorber_floor = Vec3(0.42f, 0.26f, 0.15f);
+                // plasma density falls off with distance from the host (~r^-2, Europa = 1)
+                const bool giant_host = in.host_mass_kg > 10.0 * 5.97e24;
+                w.trailing = giant_host ? static_cast<float>(0.35 * std::min(1.0, std::pow(6.71e5 / in.host_distance_km, 2.0))) : 0.0f;
+                w.brine = w.cracks ? 1.3f : 0.0f;
+            } else {  // dark lag: rock and organic dust, nearly grey, faintly brown (Callisto)
+                w.ice_clean = Vec3(0.86f, 0.89f, 0.93f);
+                w.coarse_ice = Vec3(0.20f, 0.12f, 0.05f);
+                w.absorber_k = Vec3(1.0f, 1.15f, 1.35f);
+                w.absorber_floor = Vec3(0.20f, 0.17f, 0.14f);
+            }
+            // Old airless ice darkens: sublimation leaves a lag of the rock / organic
+            // dust mixed into the ice and micrometeorites garden it in (Callisto,
+            // Ganymede's dark terrain, albedo ~0.2), in patches (terrain units);
+            // fresh ejecta (bright rays) and cold crests, where the sublimated ice
+            // condenses again, stay bright.
+            if (lag) {
+                w.weathering = std::max(w.weathering, static_cast<float>(1.2 * std::min(1.0, p.surface_age_gyr / 3.0)));
+                w.dark_amount = 0.35f;
+                w.crest_albedo = 0.6f;
+            }
+        }
     } else if (has(p.materials, "space-weathered")) {
         w.dark_amount = 0.1f;
         w.rock = Vec3(0.52f, 0.52f, 0.52f);    // neutral grey (photos)
@@ -733,13 +881,22 @@ WorldSpec world_from_physics(const PhysicalInputs& in, const PlanetPhysics& p, P
         w.bright = Vec3(0.80f, 0.80f, 0.80f);
         w.alt = Vec3(0.56f, 0.52f, 0.46f);     // warmer, less weathered plains
     } else if (has(p.materials, "rust")) {
-        // (matched on the paletted renders vs the original photo, tools/endmembers.py:
-        // dark 0.31 0.21 0.18 / median 0.56 0.33 0.25 / bright 0.70 0.41 0.29)
-        w.rock = Vec3(0.70f, 0.41f, 0.30f);    // dust: brick red (paletted render vs paletted mars.jpg, 2026-11-03)
-        w.dark = Vec3(0.31f, 0.21f, 0.18f);    // basaltic sand: dark red-brown
-        w.bright = Vec3(0.80f, 0.48f, 0.37f);
-        w.dark_amount = 0.55f;  // user pick A4 (renders/variants/mars_beautiful_800.png)
-        w.alt = Vec3(0.66f, 0.50f, 0.48f);     // desaturated pinkish fine dust
+        // The Mars photo's colour distribution only for Mars itself (calibration to
+        // its reference photo); every other rusty world takes its oxide's colours.
+        if (in.name == "mars") w.color_profile = "data/profiles/mars.prof";
+        // Hematite: matched on the paletted renders vs the original Mars photo
+        // (tools/endmembers.py: dark 0.31 0.21 0.18 / median 0.56 0.33 0.25 / bright 0.70 0.41 0.29).
+        // Goethite: ochre (yellow-brown, Earth's wetter deserts and laterites);
+        // unoxidised: basalt. Mixed by hydration, then by degree of oxidation.
+        auto oxide = [&](Vec3 hem, Vec3 goe, Vec3 bas) {
+            Vec3 ox = hem + (goe - hem) * static_cast<float>(p.rust_wet);
+            return bas + (ox - bas) * static_cast<float>(p.rust_ox);
+        };
+        w.rock = oxide(Vec3(0.70f, 0.41f, 0.30f), Vec3(0.70f, 0.55f, 0.34f), Vec3(0.33f, 0.30f, 0.28f));    // dust (Mars: brick red)
+        w.dark = oxide(Vec3(0.31f, 0.21f, 0.18f), Vec3(0.30f, 0.26f, 0.20f), Vec3(0.22f, 0.21f, 0.20f));    // basaltic sand
+        w.bright = oxide(Vec3(0.80f, 0.48f, 0.37f), Vec3(0.80f, 0.66f, 0.45f), Vec3(0.50f, 0.48f, 0.45f));
+        w.dark_amount = 0.45f;  // user pick A4 was 0.55; less dark area (user, 2026-11-04)
+        w.alt = oxide(Vec3(0.66f, 0.50f, 0.48f), Vec3(0.66f, 0.58f, 0.46f), Vec3(0.40f, 0.38f, 0.36f));   // fine dust (Mars: pinkish)
     } else if (has(p.materials, "sulfur")) {
         w.rock = Vec3(0.80f, 0.70f, 0.35f);
         w.dark = Vec3(0.30f, 0.22f, 0.15f);
@@ -755,11 +912,16 @@ WorldSpec world_from_physics(const PhysicalInputs& in, const PlanetPhysics& p, P
         w.ice = Vec3(0.93f, 0.92f, 0.90f);
         double dt = p.t_equator - p.t_pole, sc = 1.0 - std::min(p.ice_fraction, 1.0);  // sin(lat) of the edge
         w.ice_below = static_cast<float>(p.t_mean - 273.15 + dt * (1.0 / 3.0 - sc * sc));
+        // global ice has no edge (the edge's +-3 K blend and noise left the warmest cells bare)
+        if (p.ice_fraction >= 0.99) w.ice_below = static_cast<float>(p.t_equator - 273.15 + 20.0);
     }
+    // Lifeless ocean worlds (the Earth climate, shifted): land ice where Earth has
+    // it, annual mean below ~-14 C (warm summers melt the rest).
+    if (w.ocean && !w.biomes) { w.ice = Vec3(0.93f, 0.92f, 0.90f); w.ice_below = -14.0f; }
     if (!w.biomes) {
         // Photos: best fits 0.55-0.95 per body (exposures differ); bright decks
-        // are photographed near white.
-        w.auto_p95 = w.deck ? 0.9f : 0.72f;
+        // (and a rocky world under global ice) are photographed near white.
+        w.auto_p95 = w.deck || (!icy && p.ice_fraction > 0.9) ? 0.9f : 0.72f;
         // Sharp unit contacts fit Pluto's photos; chaos (ice shell) and airless
         // regolith (gardened by impacts) stay soft (tools/tune.py).
         w.edge = (w.cracks || !w.optics.enabled) ? 1.0f : 0.2f;
@@ -770,17 +932,19 @@ WorldSpec world_from_physics(const PhysicalInputs& in, const PlanetPhysics& p, P
         bool airless = !w.optics.enabled, dusty = has(p.aerosols, "dust");
         if (w.style == TerrainStyle::Stagnant || w.style == TerrainStyle::Dead) w.scarps = 1.0f;
         if (w.style == TerrainStyle::Stagnant && w.volcanism > 0.01f) w.canyons = 1.0f;
-        if (w.style == TerrainStyle::Stagnant) w.ground_detail = 1.0f;
+        if (w.style == TerrainStyle::Stagnant) w.ground_detail = 0.5f;  // stronger read as crumpled paper (vs mars.jpg)
         if (dusty) {  // user picks: streaks B4 (3 x 4; strength 2 now that old crust has ~10x
                       // more craters), dark contrast A3; the rest tools/tune.py vs the original photo
             w.streaks = 3.0f; w.streak_strength = 1.0f; w.dust = 1.0f; w.dark_mix = 1.0f;
             w.sand_lows = 1.2f;      // user pick A4
-            w.crater_relief = 0.7f;  // dust mantles small craters
             w.crater_fill = 1.5f;    // wind (and once water) filled old craters: flat floors, worn rims (user pick A3)
             w.ejecta_lobes = 1.0f;   // ground ice: rampart ejecta (dusty worlds are the ones with a frozen past here)
+            w.lommel_seeliger = 0.9f;  // the photos stay bright nearly to the limb (dust scatters once)
             w.fresh = 0.01f;         // dust blankets young ejecta and rays within ~Myr
             w.dust_texture = 0.0f;   // the wind shapes regions; its swirls are not seen in the photos
-            w.relief_light = 1.0f; w.relief_sun = 40.0f; w.shading = 1.5f;  // mosaic-style relief (user pick B1)
+            w.relief_light = 1.0f; w.relief_sun = 40.0f; w.shading = 1.0f;  // mosaic-style relief (user pick B1;
+                                     // shading 1.5 -> 1 once the mosaic light was flattened: relief outweighed albedo)
+            w.dark_level = 0.8f;     // albedo, not shadows, gives the photo's darkest tones
             w.saturation = 0.85f;
             w.auto_p95 = 0.47f;  // brick-red, not pastel (matched on the original Mars photo)
         }
@@ -791,11 +955,32 @@ WorldSpec world_from_physics(const PhysicalInputs& in, const PlanetPhysics& p, P
     }
     // Seasonal frost cap: a condensable gas whose frost point the polar night can
     // reach (thin air: little heat transport) frosts the winter pole down to
-    // ~90 - obliquity (the polar-night circle), less with heat transport.
+    // ~10 deg past the polar-night circle (90 - obliquity; the low winter sun
+    // can't keep the ground warm either: Mars' seasonal cap reaches ~50-55 deg),
+    // less with heat transport.
     for (const Volatile& v : p.volatiles)
-        if (v.state.find("seasonal") != std::string::npos && in.obliquity_deg > 5.0)
-            w.frost_lat = static_cast<float>(90.0 - in.obliquity_deg - 5.0 * (1.0 - p.redistribution)
+        if (v.state.find("seasonal") != std::string::npos && std::min(in.obliquity_deg, 180.0 - in.obliquity_deg) > 5.0)
+            w.frost_lat = static_cast<float>(90.0 - std::min(in.obliquity_deg, 180.0 - in.obliquity_deg)  // (folded: retrograde spins)
+                                             - 10.0 * (1.0 - p.redistribution)
                                              + 25.0 * p.redistribution);
+    // Lava (magma ocean, or a day side hotter than rock can stay solid): the
+    // renderer finds the molten share from each cell's temperature and draws its
+    // thermal glow (Planck at ~1300-1700 K) relative to the starlight here:
+    // `thermal` = 1 / (white ground in this star's light, in units of the Sun's at
+    // 1 AU; (R_sun / AU)^2 = 2.16e-5), at the brightest channel the renderer's star
+    // colour is normalised to.
+    w.lava = !icy && (std::max(p.t_equator, p.t_pole) > CRUST_K || p.rift > 0);
+    w.lava_rift = static_cast<float>(p.rift);
+    // A locked lava world with (nearly) no air: rock vapour from the day-side lava
+    // sea condenses on cooler ground toward the terminator (Kite et al. 2016).
+    if (w.lava && w.locked && p.pressure_bar < 0.01 && p.t_equator > LAVA_K) w.mineral_frost = 1.0f;
+    // Wind moves snow on ice-covered rocky worlds with air (snow_drift).
+    if (!icy && p.ice_fraction > 0.5 && p.pressure_bar > 0.005) w.snow_drift = 1.0f;
+    if (w.lava) {
+        Vec3 b = planck_rel(static_cast<float>(p.star_teff));
+        double m = std::max({b.x, b.y, b.z});
+        w.thermal = static_cast<float>(1.0 / (2.16e-5 * p.insolation * m * std::pow(5772.0 / p.star_teff, 4)));
+    }
     w.lights = in.civilisation;
     return w;
 }
@@ -855,6 +1040,61 @@ std::vector<std::string> preset_names() {
     std::vector<std::string> n;
     for (const Preset& p : presets()) n.push_back(p.in.name);
     return n;
+}
+
+// A new planet: inputs drawn from plausible ranges, then derive() decides the rest.
+// Insolation is drawn instead of the orbit (log-uniform: scorched to frozen, 40%
+// of planets in the habitable zone, the rarest and richest class), so every
+// class of world comes up; short phases (magma oceans after formation or a giant
+// impact, snowball climates) are drawn far more often than their share of a
+// planet's life, so they show up on a sheet; the composition follows where it formed (ice
+// beyond the snow line, ~0.1 x Earth's insolation). A quarter are moons of a
+// giant planet (cold, tidally heated, synchronous). Combinations that can't exist
+// are redrawn: age past the star's life, a moon inside the host's Roche limit or
+// outside its Hill sphere.
+PhysicalInputs random_inputs(uint32_t seed) {
+    std::mt19937 rng(seed * 2654435761u + 12345u);
+    auto uni = [&](double a, double b) { return std::uniform_real_distribution<double>(a, b)(rng); };
+    auto logu = [&](double a, double b) { return std::exp(uni(std::log(a), std::log(b))); };
+    PhysicalInputs i;
+    i.name = "random " + std::to_string(seed);
+    i.star_mass = uni(0.0, 1.0) < 0.2 ? logu(0.3, 0.6) : logu(0.6, 1.4);
+    const double lifetime = 10.0 * std::pow(i.star_mass, -2.5);
+    // 15% caught young (1-100 Myr: magma oceans, steam atmospheres)
+    i.age_gyr = uni(0.0, 1.0) < 0.15 ? logu(0.001, 0.1) : uni(0.5, std::min(10.0, 0.9 * lifetime));
+    const double lum = main_sequence_lum(i.star_mass);
+    const bool moon = uni(0.0, 1.0) < 0.25;
+    const double pick = uni(0.0, 1.0);  // (6% of planets on scorching orbits: day-side lava)
+    const double insolation = moon ? logu(0.001, 0.1) : pick < 0.4 ? logu(0.35, 1.5) : pick < 0.46 ? logu(4.0, 2000.0)
+                                                      : logu(0.003, 4.0);
+    i.orbit_au = std::sqrt(lum / insolation);
+    const bool beyond_snow = insolation < 0.1;
+    if (beyond_snow && uni(0.0, 1.0) < 0.8) {
+        i.composition = Composition::IceRock;
+        i.volatile_fraction = uni(0.05, 0.5);
+    } else {
+        i.composition = uni(0.0, 1.0) < 0.15 ? Composition::IronRich : Composition::Rocky;
+        i.volatile_fraction = i.composition == Composition::IronRich ? logu(1e-7, 1e-4) : logu(1e-6, 3e-3);
+    }
+    i.mass = moon ? logu(0.002, 0.05) : logu(0.03, 3.0);
+    i.day_hours = logu(8.0, 200.0);
+    i.obliquity_deg = uni(0.0, 1.0) < 0.85 ? uni(0.0, 35.0) : uni(35.0, 180.0);
+    i.moons = moon ? 0 : std::uniform_int_distribution<int>(0, 3)(rng);
+    i.moon_mass_ratio = i.moons ? logu(1e-8, 0.03) : 0.0;
+    // History: 10% hit by a giant impact in the last few Myr (molten again);
+    // 20% start frozen over (a snowball where that climate is stable).
+    if (uni(0.0, 1.0) < 0.1) i.impact_myr_ago = logu(0.05, 5.0);
+    i.snowball = uni(0.0, 1.0) < 0.2;
+    if (moon) {
+        i.host_mass_kg = logu(0.05, 5.0) * 1.898e27;  // Neptune .. 5 Jupiters
+        const double r_host = 7.0e4 * std::pow(i.host_mass_kg / 1.898e27, 0.1);  // giants are all ~Jupiter-sized
+        const double hill = i.orbit_au * AU / 1e3 * std::cbrt(i.host_mass_kg / (3.0 * i.star_mass * M_SUN));
+        const double lo = 2.5 * r_host, hi = 0.3 * hill;
+        if (hi <= lo) return random_inputs(seed + 0x9e3779b9u);  // no stable moon orbit: redraw
+        i.host_distance_km = logu(lo, std::min(hi, 40.0 * r_host));
+        i.host_eccentricity = logu(1e-3, 0.03);
+    }
+    return i;
 }
 
 void check_presets() {

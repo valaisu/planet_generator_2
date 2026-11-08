@@ -28,6 +28,7 @@ add_library(core STATIC
     src/maps.cpp src/cities.cpp
     src/physics.cpp
     src/craters.cpp
+    src/color_profile.cpp
 )
 target_include_directories(core PUBLIC src third_party)
 if(OpenMP_CXX_FOUND)

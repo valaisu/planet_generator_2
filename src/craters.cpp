@@ -96,14 +96,20 @@ void add_craters(Planet& P, const PlanetParams& prm) {
         float depth = dk < 15.0f ? 0.2f * dk : 3.0f * std::pow(dk / 15.0f, 0.3f);
         const float depth0 = depth * W.crater_relief;  // fresh depth (basin massifs)
         depth *= 0.35f + 0.65f * (1.0f - C.age);  // degraded with age
-        const float depth_rim = depth * W.crater_relief;  // rims outlast the floors' relaxation
+        const float depth_rim = depth * W.crater_relief * (0.4f + 0.6f * smooth01(1.5f, 3.0f, dk / (REF_SPACING * R)));  // rims outlast the floors' relaxation
         depth *= std::min(1.0f, std::pow(60.0f / dk, 0.6f) * (1.2f - C.age));  // big + old: relaxed
         depth *= W.crater_relief;
+        // Craters within ~3 cells of the default grid alias into speckle: their
+        // relief fades toward the resolution limit (in km: the same at any grid).
+        const float alias = 0.4f + 0.6f * smooth01(1.5f, 3.0f, dk / (REF_SPACING * R));
+        depth *= alias;
         // Air and water fill old craters (sediment, dust; up to `crater_fill` x
         // 1.5 km on the oldest) and wear their rims down: flat floors that bury
         // peaks and terraces; small old craters fill up into rim-only ghosts.
-        const float fill = std::clamp(W.crater_fill * C.age * 1.5f / std::max(depth, 0.05f), 0.0f, 1.0f);
-        const float rim = 0.3f * depth_rim * (1.0f - 0.7f * fill);
+        // (A mantle softens even young craters: + 0.6 of the oldest's fill.)
+        const float fill = std::clamp(W.crater_fill * (0.6f + C.age) / 1.6f * 1.5f / std::max(depth, 0.05f), 0.0f, 1.0f);
+        // Rims grow ~linearly with size (Pike), faster than depth: big craters read by their rims.
+        const float rim = 0.3f * depth_rim * std::clamp(std::pow(dk / 30.0f, 0.35f), 1.0f, 3.0f) * (1.0f - 0.7f * fill);
         const float cell_km = REF_SPACING * R;  // rays/streaks by size, not by grid
         // The youngest `fresh` share of craters is still bright (ejecta not yet
         // space-weathered, ~1 Gyr): a halo on every one, rays on those above ~2
@@ -244,7 +250,8 @@ bool set_world_knobs(WorldSpec& w, const std::string& spec) {
         {"roughness", &w.roughness}, {"scarps", &w.scarps}, {"streaks", &w.streaks}, {"ice_below", &w.ice_below}, {"frost_lat", &w.frost_lat},
         {"fresh", &w.fresh}, {"scarp_height", &w.scarp_height}, {"streak_strength", &w.streak_strength}, {"shading", &w.shading},
         {"alt_amount", &w.alt_amount}, {"auto_p95", &w.auto_p95}, {"deck_asym", &w.deck_asym}, {"deck_texture", &w.deck_texture}, {"lommel_seeliger", &w.lommel_seeliger}, {"saturation", &w.saturation}, {"edge", &w.edge}, {"lineae", &w.lineae}, {"lineae_width", &w.lineae_width}, {"grain", &w.grain}, {"exposure", &w.exposure},
-        {"dark_mix", &w.dark_mix}, {"dark_level", &w.dark_level}, {"dust", &w.dust}, {"dust_elev", &w.dust_elev}, {"sand_lows", &w.sand_lows}, {"canyons", &w.canyons}, {"dust_steps", &w.dust_steps}, {"dust_lift", &w.dust_lift}, {"dust_octaves", &w.dust_octaves}, {"dust_window", &w.dust_window}, {"dust_texture", &w.dust_texture}, {"dust_soft", &w.dust_soft}, {"relief_light", &w.relief_light}, {"relief_sun", &w.relief_sun}, {"crater_fill", &w.crater_fill}, {"ejecta_lobes", &w.ejecta_lobes}, {"ground_detail", &w.ground_detail},
+        {"dark_mix", &w.dark_mix}, {"dark_level", &w.dark_level}, {"dust", &w.dust}, {"dust_elev", &w.dust_elev}, {"sand_lows", &w.sand_lows}, {"canyons", &w.canyons}, {"dust_steps", &w.dust_steps}, {"dust_lift", &w.dust_lift}, {"dust_octaves", &w.dust_octaves}, {"dust_window", &w.dust_window}, {"dust_texture", &w.dust_texture}, {"dust_soft", &w.dust_soft}, {"relief_light", &w.relief_light}, {"relief_sun", &w.relief_sun}, {"crater_fill", &w.crater_fill}, {"ejecta_lobes", &w.ejecta_lobes}, {"ground_detail", &w.ground_detail}, {"air_haze", &w.optics.haze}, {"air_rim", &w.optics.rim},
+        {"lava_cracks", &w.lava_cracks}, {"lava_plumes", &w.lava_plumes}, {"lava_rift", &w.lava_rift}, {"lava_steps", &w.lava_steps}, {"underglow", &w.underglow}, {"mineral_frost", &w.mineral_frost}, {"snow_drift", &w.snow_drift}, {"bare_ice", &w.bare_ice}, {"weathering", &w.weathering},
     };
     size_t pos = 0;
     while (pos < spec.size()) {

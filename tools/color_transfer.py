@@ -4,10 +4,13 @@ the photo's brightness at the same brightness rank, then, within that
 brightness band, the photo's colour at the same rank along the band's main
 colour direction (so the joint brightness/colour distribution, area shares
 included, is the photo's). Background (space, stars) is left as rendered.
-    uv run --no-project --with numpy --with pillow python tools/color_transfer.py \\
-        RENDER.png PHOTO.jpg OUT.png        # render: earthgen --raw --vibrance 1 (disk framing)
+    uv run --no-project --with numpy --with pillow --with scipy --with matplotlib python tools/color_transfer.py \\
+        RENDER.png PHOTO.jpg OUT.png        # render: earthgen --raw (disk framing)
+    ... tools/color_transfer.py --save-profile PHOTO.jpg data/profiles/NAME.prof
+        # the same statistics as a file earthgen applies itself (WorldSpec::color_profile)
 """
 import sys
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -27,7 +30,8 @@ def lab_to_srgb(lab):  # (as in endmembers.py, which runs on import)
     return np.where(c <= 0.0031308, 12.92 * c, 1.055 * c ** (1 / 2.4) - 0.055)
 
 
-INNER = 0.9  # statistics from inside this fraction of the radius (the photo's limb haze is whitish)
+INNER = 0.7  # statistics from inside this fraction of the radius: beyond ~0.7 R the photo washes out
+             # to grey-white (all brightness bands lose ~4 chroma), which is the photo, not the surface
 
 
 def disk_render(h, w):
@@ -98,5 +102,31 @@ def main():
     print(f"wrote {out_p} ({len(rl)} disk px; photo statistics from {len(pl)} px inside {INNER} R)")
 
 
+def save_profile(photo_p, out_p, samples=65, n_l=257):
+    pho = np.asarray(Image.open(photo_p).convert("RGB")).astype(float) / 255
+    mp, rp = disk_photo(pho)
+    pl = srgb_to_lab(pho[mp & (rp < INNER)])
+    p_order = np.argsort(pl[:, 0])
+    p_L = pl[p_order, 0]
+    lines = [f"colorprofile {BINS} {samples} {n_l}",
+             " ".join(f"{v:.3f}" for v in np.interp((np.arange(n_l) + 0.5) / n_l, (np.arange(len(p_L)) + 0.5) / len(p_L), p_L))]
+    for b in range(BINS):
+        ab_p = pl[p_order[int(b / BINS * len(pl)):int((b + 1) / BINS * len(pl))], 1:]
+        d = np.linalg.svd(ab_p - ab_p.mean(0), full_matrices=False)[2][0]
+        if d[0] < 0:
+            d = -d
+        ps = ab_p[np.argsort(ab_p @ d)]
+        k = max(5, len(ps) // 20)
+        x, xs = (np.arange(len(ps)) + 0.5) / len(ps), (np.arange(samples) + 0.5) / samples
+        a_s, b_s = np.interp(xs, x, smooth(ps[:, 0], k)), np.interp(xs, x, smooth(ps[:, 1], k))
+        lines.append(f"{d[0]:.5f} {d[1]:.5f} " + " ".join(f"{v:.3f}" for v in a_s) + " " + " ".join(f"{v:.3f}" for v in b_s))
+    Path(out_p).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_p).write_text("\n".join(lines) + "\n")
+    print(f"wrote {out_p} ({BINS} bands from {len(pl)} photo px)")
+
+
 if __name__ == "__main__":
-    main()
+    if sys.argv[1] == "--save-profile":
+        save_profile(sys.argv[2], sys.argv[3])
+    else:
+        main()

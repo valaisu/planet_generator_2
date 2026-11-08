@@ -183,13 +183,13 @@ void generate_other_terrain(Planet& P, const PlanetParams& prm) {
             young = 0.97f * low;  // the lowlands are volcanic plains: their craters are erased
             if (W.ground_detail > 0.0f) {
                 // Ground between the craters: old crust is knobby and rough (hills
-                // at ~40-90 km, battered by impacts); the boundary scarp breaks up
+                // at ~90 km, battered by impacts); the boundary scarp breaks up
                 // into flat-topped mesas and knobs (fretted terrain); young plains
                 // carry wrinkle ridges (sinuous compressional ridges, noise contours).
                 Vec3 q = normalize(d + noise_vec(d * 6.0f + off * 1.9f, 3) * 0.05f);
+                // (a finer ~40 km octave doubled the 1-px detail vs the photos: left out)
                 float k1 = 1.0f - std::fabs(2.0f * fbm3r(q * 40.0f + off * 2.3f, 3) - 1.0f);
-                float k2 = 1.0f - std::fabs(2.0f * fbm3r(q * 90.0f + off * 3.7f, 3) - 1.0f);
-                h += W.ground_detail * RMAX * (1.0f - low) * (0.025f * k1 * k1 + 0.012f * k2 * k2);
+                h += W.ground_detail * RMAX * (1.0f - low) * 0.025f * k1 * k1;
                 float edge = 4.0f * low * (1.0f - low);
                 float mesa = smooth01(0.56f, 0.6f, fbm3r(q * 30.0f + off * 4.1f, 3));
                 h += W.ground_detail * RMAX * 0.03f * edge * mesa;

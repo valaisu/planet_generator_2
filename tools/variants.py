@@ -6,9 +6,11 @@ with its ID and the args; optional reference tile first.
         --var "A=--world scarps=0" --var "B=--world scarps=1" --var "C=--world scarps=2" [--cols 4]
 A variant "ID=@path.png" is an image tile (e.g. each row's reference). A variant can also be a grid: --grid "scarps=0,1,2" --grid "streaks=0,1" (all combinations
 of --world knobs, IDs A1, A2, ...).
+Each tile is also saved to OUT_tiles/ (+ index.json) for tools/picker.py.
 """
 import argparse
 import itertools
+import json
 import shlex
 import string
 import subprocess
@@ -69,7 +71,19 @@ def main():
         draw.text((x, y), vid, fill=(240, 240, 245), font=font)
         draw.text((x, y + 16), args.replace("--world ", "")[:40], fill=(150, 150, 160), font=font)
     sheet.save(a.out)
+    save_tiles(Path(a.out), [(vid, args.replace("--world ", ""), im) for vid, args, im in tiles])
     print(f"wrote {a.out} ({len(variants)} variants)")
+
+
+def save_tiles(out, tiles):
+    """Each tile as its own PNG in OUT_tiles/ + index.json (for tools/picker.py)."""
+    d = out.with_name(out.stem + "_tiles")
+    d.mkdir(parents=True, exist_ok=True)
+    index = []
+    for vid, label, im in tiles:
+        im.save(d / f"{vid}.png")
+        index.append({"id": vid, "label": label, "file": f"{vid}.png"})
+    (d / "index.json").write_text(json.dumps(index, indent=1))
 
 
 if __name__ == "__main__":

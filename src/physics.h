@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,10 @@ struct PhysicalInputs {
     // When the body is itself a moon of a giant: the host and the forced orbit
     // (tidal heating, synchronous rotation). host_mass = 0: orbits the star.
     double host_mass_kg = 0.0, host_distance_km = 0.0, host_eccentricity = 0.0;
+    // History: a giant impact this long ago melted the surface (< 0: none); the
+    // climate started frozen over (snowball; kept only where that state is stable).
+    double impact_myr_ago = -1.0;
+    bool snowball = false;
     // Overrides / choices
     Regime regime = Regime::Auto;
     Tristate life = Tristate::Auto;
@@ -62,6 +67,10 @@ struct PlanetPhysics {
     double tidal_heat_wm2 = 0;
     // Interior
     double heat_flux_wm2 = 0.08;      // total surface heat flow
+    double melt_myr = 1e9;            // since the surface was last molten (formation or a giant impact)
+    double magma_tau_myr = 0;         // how long that magma ocean lasts
+    double melt = 0;                  // 0..1: share of the surface still molten (lava between crust plates)
+    double rift = 0;                  // after the crust closed: molten share still breaking out along its cracks
     Regime regime = Regime::PlateTectonics;
     double volcanism = 1;             // Earth = 1
     std::string volcanism_type;
@@ -80,6 +89,7 @@ struct PlanetPhysics {
     double cloud_amount = 0;          // mean cloud opacity for the renderer
     double greenhouse_tau = 0;
     bool runaway = false;
+    bool snowball = false;            // ocean frozen over (CO2 still in carbonates)
     // Climate
     double albedo = 0.3, t_eq = 255, t_mean = 288, t_equator = 300, t_pole = 260, t_winter_pole = 230;
     double redistribution = 0.2;      // 0 = radiative equilibrium per latitude, 1 = uniform
@@ -92,6 +102,9 @@ struct PlanetPhysics {
     std::string ocean_colour;
     // Surface
     std::vector<std::string> materials;
+    // Iron oxides (rusty worlds): degree of oxidation (0 = grey basalt, 1 = fully
+    // rusted) and hydration (0 = red hematite, dry; 1 = ochre goethite, wet).
+    double rust_ox = 0, rust_wet = 0;
     // Life
     bool life = false, oxygen = false;
     double pigment_rgb[3] = {0, 0, 0};
@@ -107,5 +120,7 @@ WorldSpec world_from_physics(const PhysicalInputs& in, const PlanetPhysics& p, P
 // Solar-system presets with real inputs; name -> false if unknown.
 bool planet_preset(const std::string& name, PhysicalInputs& in);
 std::vector<std::string> preset_names();
+// A new planet: plausible random inputs (same seed -> same planet).
+PhysicalInputs random_inputs(uint32_t seed);
 // Derived vs real values for every preset (stdout table).
 void check_presets();

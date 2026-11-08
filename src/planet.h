@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -26,6 +28,15 @@ constexpr float EARTH_RADIUS_KM = 6371.0f;
 // renderer shows every planet at the same size, so relief reads as h / R.
 enum class TerrainStyle { Plates, Stagnant, Dead, IceShell };
 
+// Lava: molten rock radiates at ~LAVA_K; ground whose (brightness) temperature is
+// above CRUST_K shows lava between crust plates.
+constexpr float LAVA_K = 1500.0f, CRUST_K = 700.0f;
+// Planck radiance at the R/G/B wavelengths (610/550/465 nm) relative to the Sun's (5772 K).
+inline Vec3 planck_rel(float t) {
+    auto b = [t](float x) { return (std::exp(x / 5772.0f) - 1.0f) / (std::exp(std::min(x / t, 80.0f)) - 1.0f); };
+    return Vec3(b(23587.0f), b(26160.0f), b(30942.0f));
+}
+
 // Atmosphere optics for the renderer (Earth = 1 / white).
 struct AtmoOptics {
     bool enabled = true;
@@ -35,6 +46,8 @@ struct AtmoOptics {
     float height = 1.0f;            // scale height / radius, x Earth's
     float mie_g = 0.76f;            // aerosol phase asymmetry (forward scattering)
     float mie_height = 1.0f;        // aerosol scale height, x Earth's (well-mixed dust: 2 = the gas's)
+    float haze = 1.0f;              // haze seen over the ground, x the view's (dusty air: the limb brightens)
+    float rim = 1.0f;               // glow shell off the limb (disk view), x its thickness
 };
 
 struct WorldSpec {
@@ -50,7 +63,8 @@ struct WorldSpec {
     float crater_density = 0.0f;    // craters > 1 km relative to lunar maria on old crust (saturates ~10)
     float crater_density_young = 0.0f;  // ... on fully resurfaced plains
     float radius_km = EARTH_RADIUS_KM;  // real size (crater sizes / depths)
-    float crater_relief = 1.0f;     // crater depth factor (ice relaxes / frost mantles them)
+    float crater_relief = 0.4f;     // crater depth factor: the disk view's 25x relief exaggeration is for
+                                    // Earth's gentle hills; steep crater walls at 1 read as plaster pits
     float ground_detail = 0.0f;     // stagnant lid: knobby old crust, boundary mesas, wrinkle ridges, x
     float crater_fill = 0.0f;       // old craters filled (flat floors, worn rims) by air/water, x age
     float ejecta_lobes = 0.0f;      // volatile-rich ground: lobate (rampart) ejecta, central pits
@@ -73,6 +87,7 @@ struct WorldSpec {
     float deck_texture = 1.0f;      // swirl contrast: convective clouds 1, photochemical haze ~0.2
     float lommel_seeliger = 0.0f;   // ground scattering law: 0 Lambert, 1 Lommel-Seeliger (dark regolith)
     float saturation = 1.0f;        // material colour saturation (lifeless worlds), x
+    std::string color_profile;      // photo colour profile (data/profiles, tools/color_transfer.py); "" = modelled colours
     float edge = 1.0f;              // width of the transitions between material regions, x
     float grain = 1.0f;             // gentle brightness noise everywhere (+-6% at 1), x
     // Surface colour: Earth biomes, or the material model below.
@@ -98,6 +113,23 @@ struct WorldSpec {
     Vec3 frost{0.92f, 0.90f, 0.88f};
     Vec3 stain{0.5f, 0.3f, 0.2f};   // cracks + chaos (Europa salts) or tholins (Pluto)
     float stain_amount = 0.0f;
+    // Physical icy surface (absorber_floor.x > 0 turns it on): the material
+    // regions above keep their shapes, but each material's colour is clean ice
+    // darkened and tinted by an absorbing contaminant (tholin, radiolysed sulfur
+    // salts) of column t:  R = floor + (ice_clean - floor) * exp(-absorber_k * t)
+    // (a trace: cream/yellow, more: tan-orange, a lot: the contaminant's own dark
+    // colour; a curve in colour space set by the material). The columns come from
+    // processes: haze fallout (`fallout`: bare stained ground; a trace in the
+    // frost), plasma on a moon's trailing hemisphere (`trailing`), endogenic brine
+    // in chaos and lineae radiolysed by that dose (`brine`), and `weathering`: the
+    // column old (not resurfaced) ground collects over its exposure age (a dark
+    // sublimation / dust lag on airless ice, tholins from irradiated CH4 ice).
+    Vec3 ice_clean{0.9f, 0.9f, 0.9f};
+    Vec3 absorber_k{1, 1, 1}, absorber_floor{0, 0, 0};
+    Vec3 coarse_ice{0, 0, 0};       // reflectance lost by old coarse ice grains (water ice: most in red)
+    float fallout = 0.0f, trailing = 0.0f, brine = 0.0f, weathering = 0.0f;
+    float volatile_band = 30.0f;    // deg: volatile frost stays off |lat| below ~this (stained belt)
+    bool true_color = false;        // physical colours: no --vibrance grade
     // Albedo coupled to the terrain (> 0 brighter, < 0 darker), by process:
     // airless: steep slopes stay fresh (bright) while flats space-weather dark;
     // dusty air: dust settles on flats, slopes/crests show dark rock;
@@ -129,8 +161,27 @@ struct WorldSpec {
     // coordinates advected by the wind over the last `dust_window` steps
     // (longer = more stretched), mixed in by `dust_texture`.
     float dust_octaves = 4.0f, dust_window = 75.0f, dust_texture = 0.4f;
-    float dust_soft = 0.15f;         // dust cover: transition half-width in area rank (0.08 ~ two materials)
+    float dust_soft = 0.07f;         // dust cover: transition half-width in area rank (0.08 ~ two materials)
     bool lights = true;             // civilisation: cities + night lights
+    bool lava = false;              // molten rock shows where the ground is hotter than CRUST_K
+    float thermal = 0.0f;           // lava glow scale: 1 / starlit white ground in Sun-at-1-AU units
+    // Lava patterns (lava_share / crust_age): the exposed melt is the youngest
+    // crust, which the simulated flow carries away from upwelling plumes;
+    // `lava_cracks` = weight of the crack network that breaks old crust into
+    // plates; `lava_plumes` = number of upwellings; `lava_steps` = weather steps
+    // the flow carries the crust (more = more drawn out and folded). `lava_rift` = molten share
+    // along a rift network after a magma ocean has crusted over (young hot crust).
+    float lava_cracks = 0.1f, lava_plumes = 40.0f, lava_rift = 0.0f, lava_steps = 150.0f;
+    // Clouds over lava are lit from below by its glow (x this).
+    float underglow = 1.0f;
+    // Rock vapour from a dayside lava sea condenses where the ground is cool
+    // enough (toward the terminator): pale mineral frost, in wind streaks.
+    float mineral_frost = 0.0f;
+    Vec3 mineral{0.80f, 0.77f, 0.70f};
+    // Wind-drifted snow on ice (same machinery as dust): scoured areas expose
+    // bare glacier ice (blue ice), `bare_ice` of the ice by area.
+    float snow_drift = 0.0f, bare_ice = 0.3f;
+    Vec3 blue_ice{0.50f, 0.62f, 0.72f};
 };
 
 // Every simulated field lives on the same cube-sphere grid.
@@ -160,6 +211,9 @@ struct Planet {
     std::vector<float> streak;        // 0..1: wind streaks (dust tails behind craters)
     std::vector<float> crater_sand;   // 0..1: dark sand on crater floors (dusty air)
     std::vector<float> wind_dust;     // surface dust laid down by the simulated weather (dusty worlds)
+    std::vector<float> lava_share;    // 0..1 molten share of each cell (lava worlds; lava_fields)
+    std::vector<float> crust_age;     // lava: crust age from the simulated flow (clouds.cpp)
+    std::vector<float> snow;          // snow drift: snow left by the simulated wind (relative)
 
     // Drainage (compute_drainage, after the climate)
     std::vector<int> flow_to;         // receiver cell of each land cell (-1 for sea)
@@ -198,6 +252,7 @@ bool set_world_knobs(WorldSpec& w, const std::string& spec);
 void erode(Planet& p, const PlanetParams& prm);
 void simulate_climate(Planet& p, const PlanetParams& prm);
 void compute_drainage(Planet& p);  // rivers: flow_to + drainage (needs the climate)
+void lava_fields(Planet& p, uint32_t seed);  // lava_share (after the climate, before the clouds)
 void place_cities(Planet& p, const PlanetParams& prm);  // needs climate + drainage
 void simulate_clouds(Planet& p, const PlanetParams& prm);
 // Animations: keep the weather running. start_clouds = simulate_clouds that

@@ -352,8 +352,62 @@ checked that it survives the 128 px pixel art. Every step is a general rule.
 - [x] Picks: A3 + A4 (crater_fill 1.5, sand_lows 1.2, dark_amount 0.55) are Mars defaults.
 - [x] Looser colours tried as random regional tints (`color_variety`): rejected (invented
       colours got their own palette slots). Removed.
-- [ ] Colour transfer: render = structure, colours = the photo's joint L/chroma distribution
-      (tools/color_transfer.py prototype), then a per-material colour profile for new planets.
+- [x] Colour transfer: render = structure, colours = the photo's joint L/chroma distribution.
+      In earthgen: `WorldSpec::color_profile` (data/profiles/mars.prof from
+      tools/color_transfer.py --save-profile), applied to planet pixels before the palette,
+      no vibrance on them; brightness half rank-matched, half mean/spread (never stretched).
+      Paletted Mars vs paletted photo: L/a/b within ~2, sdL/sdC/hue_var ~1x (hue_var was 0.25x).
+- [ ] Colour profiles per material class from several photos (rust, basalt, ice, tholin) so
+      new planets get photo colours; blend by physics.
+- Overnight loop (2026-11-03/04; sheets renders/loop/iterNN.png = photo | face 0 | yaw 160,
+  colour-transferred; tools/loop_sheet.sh):
+  - [x] it1: small craters too crisp/lunar, dark regions blurry -> mantle on young craters,
+        rims ~ D^0.35, less wind-field blur, dust_soft 0.07.
+  - [x] it2: limb darkened (rank transfer turned it basalt-grey), frost a band -> mosaic
+        light also flattens day-side lighting; dust g 0.2 + 3x haze (stand-in for multiple
+        scattering; limb stays bright to 0.9 R like the photo); frost solid only inside the
+        cap, spots on pole-facing walls/hollows toward its edge.
+  - [x] it3: no dark belts, smooth blob edges -> lift threshold halfway global/per band;
+        wind + terrain on one scale (rank z-score); robust (16-84 %) scale for the lows
+        (sd was dominated by canyons/basins: ordinary lows were ~0.05 sd, the terrain
+        term did nothing).
+  - [x] it4: crumpled-paper ground, uniform bright areas -> ground_detail 0.5, two-way
+        wind streaks (bright tails in dark ground, dark tails in dusty ground). Detail
+        stats at 128 px: band1 1.4x mars.png from the dust/terrain edge intricacy (terrain
+        weight 0.15 compromise: 0 gives 1.2x but loses the edges seen at 800 px).
+  - [x] it5: dark areas medium grey (relief outweighed albedo: the darkest ranks went to
+        crater shadows) -> shading 1.0, dark_level 0.8.
+  - [x] it6: colour profile moved into earthgen (see above); rank-only brightness stretched
+        a dusty face's relief to the photo's range -> half rank / half capped affine.
+  - [x] it7-8: lavender streaks (dark tails 0.7 -> 0.35); 1-px outline at 128 px (profile
+        skipped the edge ring); craters within 3 default cells fade (anti-aliasing, in km).
+  - [x] it9: high latitudes scoured bare (polar eddies strongest) while real Mars is bright
+        there -> seasonal frost locks the ground (no lift within ~15 deg of the cap edge,
+        ragged edge): bright high latitudes, dark mid-latitude belts.
+  - [x] it10 (user feedback 2026-11-04): grey cast all over = the photo's washed-out limb in
+        the profile (0.7-0.9 R loses ~4 chroma in every band) -> profile statistics from
+        < 0.7 R; ice/frost (chroma/L < ~0.3) keeps its modelled white and stays out of the
+        statistics; glow shell thin (`optics.rim` 0.3, knob air_rim) + haze 3 -> 1.5;
+        frost to ~10 deg past the polar-night circle (55 deg, sheet pick B); dark_amount
+        0.55 -> 0.45; crater_relief 0.7 -> 0.45; crater-floor sand x0.4.
+  - Open: dark belts at mid latitudes, not the photo's low-latitude band; 128 px default face 1.4x fine detail (dust/terrain edge
+    pattern); old
+    valley networks; physical lighting that still shows relief.
+
+### Physical colours (2026-11-04; user: no colour-line constraint, physics not hand-picked colours)
+- [x] Icy worlds: material colours from clean ice + absorber column (tholin / radiolysed sulfur
+      salts; fallout, trailing-side plasma dose, brine). Enhanced Pluto photo dropped.
+- [x] First tries replaced the region shapes too (flat blobs, then speckle noise): user preferred
+      the old shapes -> hybrid (user pick): old regions, physical colours
+      (renders/variants/icy_hybrid.png). Europa red-brown 30 vs 30 %; Pluto dark 36 vs 18 % (old belt).
+- [ ] Shapes, one change at a time: Europa's red concentrated in the middle with blue-grey limb;
+      Pluto one dark region instead of a belt.
+- [ ] Same approach for Mars (replace the photo profile with physical dust/basalt/frost
+      materials once they match), Mercury, Titan's surface.
+- [ ] Brightness: icy disks dimmer than the photos (lighting law).
+- [x] Crater relief too deep everywhere (user: Mercury) -> one default `crater_relief` 0.4 for all
+      worlds (was 1; Mars override 0.45 removed; ice x0.85 for relaxation).
+      Sheet renders/variants/crater_relief.png (0.15-1.0 x Mercury/Mars/Europa/Pluto): 0.4 kept (user moved on).
 
 ### Phase D: solar system one by one (each adds one capability)
 - [ ] Mercury (airless, craters, rays) -> Mars (thin dusty air, rust, caps, relict
@@ -362,6 +416,92 @@ checked that it survives the 128 px pixel art. Every step is a general rule.
       Comparison sheet: preset render next to its reference.
 
 ### Phase E: new planets
-- [ ] Sample inputs from plausible distributions -> derive -> render; sheet of random
-      planets; reject or flag impossible combinations.
+- [x] Sample inputs from plausible distributions -> derive -> render; sheet of random
+      planets; reject or flag impossible combinations (2026-11-04): `random_inputs(seed)`
+      (physics.cpp), `--random N`, `tools/random_sheet.py` -> renders/random_sheet.png.
+      Insolation log-uniform (40% of planets in the habitable zone), ice-rich beyond the
+      snow line, 25% moons of giants (Roche / Hill limits); 200 seeds: ~60% airless,
+      ~10% ocean worlds, ~5% runaway. Physics fixes it exposed (presets unchanged):
+      rust only with an early ocean or water vapour (oxidants), dust only on bare
+      ground (ice < 90%), global ice has no edge.
+- [ ] Open (seen on the first sheet): every rusty world gets the Mars photo profile ->
+      Mars clones (physical rust/basalt/frost colours, as for the icy worlds); every
+      N2-ice world gets one big Sputnik-like basin (big white blob); plain icy worlds
+      without tholins/salts are featureless; M/K-dwarf light makes ice orange (physical,
+      but no white balance).
+- [x] History, not only equilibrium (2026-11-05; user: young Earth was molten, Mars was wet):
+      magma oceans after formation or a giant impact (`impact_myr_ago`; lasts ~1 Myr dry,
+      ~4 Myr with Earth's water, ~30x under steam inside the runaway limit), their heat in
+      the climate (steam atmospheres -> white water-cloud deck); lava drawn from each cell's
+      temperature (crust-plate borders + lows by area rank, Planck glow vs the starlight;
+      also scorching day sides); snowball climates (`snowball`: frozen start, CO2 stays in
+      carbonates, kept only where stable; plates continue under the ice). Sampler: 15%
+      young, 10% recent impacts, 6% scorching orbits, 20% snowball starts, bone-dry rocky
+      worlds allowed. 300 seeds: ~5% magma oceans, ~5% lava day sides, ~7% snowballs.
+- [x] Richer molten worlds (2026-11-05; user: lava read as noise, wants clouds / shifting
+      snow / blue ice interacting): lava crust driven by the weather flow (crust age
+      advected, reset over upwelling plumes; exposed melt = youngest crust + a crack
+      network); convective steam clouds over hot ground too thin for a deck, lit from
+      below by the glow; young crust after the magma ocean closes (`lava_rift`: melt along
+      its cracks for ~3 closing times); mineral frost from rock vapour on locked airless
+      lava worlds; wind-drifted snow on icy rocky worlds with air (`snow_drift`), scoured
+      areas = bare blue ice.
+- [x] User picks (picker notes 2026-11-05): lava_39 all fine; lava_197 (nearly all molten)
+      uniform/boring; molten types 1-9 fine, mineral frost boring (accepted: not every idea works).
+- [x] Edge anomaly on glowing worlds (user): grey rim band + terminator crescent + dotted
+      limb -> one glow/starlight exposure, glow skips the sun-path reddening, auto exposure
+      as a per-ray gain (2026-11-06).
+- [ ] Open: wet early Mars (needs extra early warming: H2-CO2 CIA / volcanic episodes);
+      locked worlds' hot spot is fixed at lon 0, it doesn't follow `--sun-az`.
 - [ ] Later: gas giants, rings, moons in frame, seasons/animations, binary stars.
+
+## Preference learning (agreed 2026-11-07)
+
+Goal (user): find planets the user likes that are also distinct from each other.
+Judgments are comparisons (best of 2-4), not 0-9 scores. The user decides the DL
+part (pretrained embedding such as DINOv2/CLIP, maybe label-free fine-tuning on the
+pool, a preference head, diversity) once there is data, and wants to understand each step.
+
+- [x] Pool of pre-rendered random planets (`tools/pool.py`, incremental, ~8 s each) +
+      ranking app (`tools/rank.py`: rank-order sets of up to 6 (user: more efficient than
+      best-of) -> `comparisons.jsonl`, Swiss-style set choice, Bradley-Terry ranking page) (2026-11-07).
+- [x] Tier page (user: ranking within a set forced arbitrary calls between equally good/bad
+      planets): batches of ~40, drag into tiers S-D; same tier = no preference (2026-11-07).
+- [x] "+10 planets" into a batch in progress; black planet (#32, also #61/#72/#76 too dark):
+      the glow exposure dimmed steam-deck worlds whose deck hides all the glow (2026-11-07).
+- [x] Tier rows collapsed to one row (newest first, "all" expands), 96 px tiles (user: tall
+      tiers needed scrolling); unsorted planets one at a time, large, keys 1-5 / space; click a tier to place it (2026-11-07).
+- [x] Pool bugs (user): #67 frost over a whole hemisphere (retrograde obliquity not folded),
+      #47 seams at cube faces/equator (rank ties ordered by cell index) (2026-11-07).
+- [x] Variety (user: few molten/icy worlds seen, ~15% Mars clones). Census of 300 seeds: 43% ice,
+      19% rusty, 11% ocean, 9% molten (10 of 17 magma oceans under steam decks). Ice worlds
+      rendered plain (only plasma staining + haze fallout had colours): `weathering` = absorber
+      column on old ground by exposure age (dark lag on old airless ice, Callisto; tholins from
+      CH4 ice without haze), brine on planets/tholin worlds stains too. Rust: oxide by water
+      history (`rust_ox` = ocean or vapour x age, `rust_wet` = liquid water now -> goethite
+      ochre vs hematite red vs grey basalt); the Mars photo profile only for Mars. Presets and
+      Earth byte-identical. Old pool + its judgments archived as `pool_v1/` (2026-11-07).
+- [x] Balanced pool (user: demo types missing from the pool): `pool.py --balanced N` picks up
+      to N seeds per world type from the --describe card (21 types; rare ones 1-4% each), the
+      sampler unchanged; pool = seeds 1-100 + 91 balanced (2026-11-07).
+- [ ] Open (optional, user's call): sampler weights (fewer frozen-over, more dry molten worlds);
+      dusty worlds still use the Mars mosaic's relief light (relief_light=1), not physical light.
+- [ ] Collect judgments (~200+), then the user picks the model design.
+- [x] DINOv2 label-free fine-tuning (user, 2026-11-07): `tools/views.py` renders 4 raw 224 px
+      views per planet (pool seeds first, then balanced by type; 576 planets in `views/`),
+      `tools/dino.py` DINO-style fine-tune of ViT-S/14 (last 4 blocks, views of one planet =
+      positives, Sinkhorn-Knopp centering: DINO's EMA centering collapsed onto ~10 slots), eval on
+      91 held-out seeds: view@1 0.66 -> 0.89, hard@1 (view 0 vs 3) 0.40 -> 0.66, world-type 5-NN
+      0.69 -> 0.65 (flat, noisy). Sheet `renders/dino/neighbors_vits14.png` (2026-11-08).
+- [x] Pool = the 576 DINO-view planets (`pool.py pool --from views/index.json`, ~385 new renders),
+      so every tier judgment has an embedding (2026-11-08).
+- [x] Preference models (`tools/prefs.py`, 2026-11-08), on the 576-planet tiering, pairwise accuracy
+      out-of-fold (0.5 chance): user's own re-tiering of 191 planets agrees 0.90 (noise ceiling);
+      world type 0.76; raw generation inputs 0.70 (trees; can't learn the inputs -> world mapping
+      from 576 planets); physics card 0.85 (trees > ridge); DINOv2 frozen 0.90 (ridge), fine-tuned
+      0.88 (the fine-tune did not help); ensemble 0.89. Dislikes: Titan-like haze (mean tier 0.1),
+      Pluto-like N2 ice; likes: old dark ice, living ocean worlds.
+- [x] `tools/showcase.py` (user: N=42 interesting planets, A/B fine for variety): card trees skip
+      likely-disliked seeds before rendering, ridge on frozen DINO embeddings of the pixel art
+      (CV 0.90) predicts the tier, greedy MMR (B or better eligible, diversity 0.65) (2026-11-08).
+- [ ] Open (user's call): re-weight the random sampler with the card model; tier the showcase.

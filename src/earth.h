@@ -29,8 +29,10 @@ constexpr float AMBIENT = 0.04f;
 // the vertical optical depth stays Earth's either way.
 // `haze` scales the in-scattered light over a surface (not the limb or sky).
 // `opt` scales Earth's coefficients / heights for other worlds (off = airless).
+// `emit`: light the surface gives off itself (lava glow): only the view path dims it.
 Vec3 atmosphere(Vec3 origin, Vec3 dir, Vec3 base, float t_surface, Vec3 to_sun,
-                Vec3 sun_color, float scale, float haze = 1.0f, const AtmoOptics& opt = AtmoOptics{});
+                Vec3 sun_color, float scale, float haze = 1.0f, const AtmoOptics& opt = AtmoOptics{},
+                Vec3 emit = Vec3(0, 0, 0));
 
 // Ray through image-space point (x, y) of a w x h image (row 0 = top; pixel
 // centres at +0.5).

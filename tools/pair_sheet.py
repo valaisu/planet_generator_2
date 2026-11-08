@@ -22,7 +22,6 @@ PAIRS = [
     ("references/solar/titan_x4.png", "Titan", "titan"),
     ("references/solar/titan_infrared_x4.png", "Titan (infrared photo)", "titan"),
     ("references/solar/pluto_x4.png", "Pluto", "pluto"),
-    ("references/solar/pluto_enhanced_x4.png", "Pluto (enhanced photo)", "pluto"),
 ]
 # Sun turned toward the camera for bodies photographed near full phase (as in
 # tools/eval_all.sh), so lighting doesn't confound the comparison.
