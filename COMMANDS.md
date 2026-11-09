@@ -37,6 +37,7 @@ clouds drift and change; one shared palette; ~70 s for 240 frames)
 tools/animate.sh orbit 720 24 --seed 3 --orbits 1 --cloud-minutes 20     # OUT_STEM FRAMES FPS [earthgen args]
 tools/animate.sh clouds 360 24 --seed 3 --orbits 0 --cloud-minutes 20    # cloud demo: fixed camera
 tools/animate.sh renders/spin/20121 192 24 --random 20121 --spin --orbits 0.3 --sky-speed 0.067 --cloud-minutes 4.3  # planet spins under a fixed sun (0.3 turns in 8 s), sky at 0.067x the planet; cloud-minutes = rotation_h*60*orbits/frames
+tools/animate.sh renders/orbit/magma_20064 640 24 --random 20064 --orbits 1 --sky-speed 0.067 --cloud-minutes 2  # one orbit (day -> night -> day), slow stars
 uv run --no-project python tools/spin.py --n 10     # spinning clips of the 10 most distinct showcase picks -> renders/spin/
 uv run --no-project --with pillow python tools/leo_showcase.py --n 20   # low-orbit views of 20 showcase picks -> renders/leo_showcase/sheet.png
 tools/animate.sh leo_fly 720 24 --seed 3 --view leo --km-per-frame 1     # LEO fly-along (~0.7 s/frame)

@@ -6,6 +6,7 @@
 #include "shade.h"
 
 namespace {
+
 // Cloud layer altitude: ~0.6 Rayleigh scale heights (~5 km on Earth), scaled with
 // the view's atmosphere so cloud tops sit above the same share of the air (the
 // exaggerated disk atmosphere otherwise tinted them cream).
@@ -168,7 +169,11 @@ Shaded shade(const Scene& S, const View& view, const Ray& r) {
     if (ground && !W.deck) {
         Vec3 n = normalize(o + d * g0);
         float h = g.sample(P.elevation, n);
-        const float relief_amp = 300.0f + 0.35f * std::fabs(h);  // rougher in high terrain
+        // Earth-tuned sub-grid relief (plate worlds). Elsewhere it scaled with
+        // kilometres of crater/stagnant relief into swirly streaks: there it only
+        // shapes coasts, and the detail comes from a finer grid (main.cpp).
+        const bool plates = W.style == TerrainStyle::Plates;
+        const float relief_amp = plates ? 300.0f + 0.35f * std::fabs(h) : 300.0f;  // rougher in high terrain
         auto detail_h = [&](Vec3 p) {
             // Sub-grid relief, domain-warped so coasts get capes, bays and spits
             // rather than round noise blobs; finest octave ~10 km (finer = grain).
@@ -200,26 +205,26 @@ Shaded shade(const Scene& S, const View& view, const Ray& r) {
             normal = normalize(g.sample(S.relief, n));
             if (v.detail) {
                 Vec3 grad = tangent_grad(n, 1.0f / 3000.0f, hd, detail_h) / (EARTH_RADIUS_KM * 1000.0f);
-                normal = normalize(normal - grad * 10.0f);
+                if (plates) normal = normalize(normal - grad * 10.0f);
                 // Texture follows the terrain: hollows greener/darker (wetter),
                 // rises paler/drier, plus patchy cover at ~50 km.
                 float rel = hd / relief_amp;
                 float patch = fbm3(n * 120.0f + off * 4.0f, 3);
                 // (fbm3 with 3-4 octaves: median 0.5, sd ~0.12; rel sd ~0.22.)
                 float wet = std::clamp(0.5f - 1.0f * rel + 2.5f * (patch - 0.5f), 0.0f, 1.0f);
-                albedo = vmul(albedo, Vec3(1.30f, 1.18f, 0.88f) * (1.0f - wet) + Vec3(0.70f, 0.90f, 0.70f) * wet);
+                if (W.biomes) albedo = vmul(albedo, Vec3(1.30f, 1.18f, 0.88f) * (1.0f - wet) + Vec3(0.70f, 0.90f, 0.70f) * wet);
                 // Lakes in low, flat, wet country (Florida, Canadian shield),
                 // rarer elsewhere (~2% vs ~0.5% of the area); not on ice.
                 float lowland = smooth01(700.0f, 100.0f, h);
                 float rain = smooth01(500.0f, 1500.0f, g.sample(P.precip, n));
                 float lake = fbm3(n * 160.0f + off * 5.0f, 3) - 0.08f * rel;
-                bool water = lake > 0.81f - 0.05f * lowland * rain && albedo.y < 0.5f;
+                bool water = W.ocean && lake > 0.81f - 0.05f * lowland * rain && albedo.y < 0.5f;  // (no liquid: no lakes)
                 // Rivers along the drainage network (each big-enough cell to the
                 // cell it drains to), warped so they meander off the grid; a
                 // green strip along them through dry land (the Nile).
                 float dk, width;
                 bool river = false;
-                if (!water && river_near(P, n, off, dk, width)) {
+                if (!water && W.ocean && river_near(P, n, off, dk, width)) {
                     // At least a pixel's ground footprint here (grows toward the
                     // horizon), so rivers stay continuous lines instead of dots.
                     float foot = g0 * EARTH_RADIUS_KM * v.pixel_rad / std::max(0.25f, -dot(d, n));

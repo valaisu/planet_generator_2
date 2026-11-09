@@ -6,7 +6,8 @@
 //            [--frames N [--orbits 1] [--cloud-minutes 20]]   (disk animation -> <out stem>_frames/;
 //            orbits 0 = fixed camera; weather time per frame, 0 = frozen clouds)
 //            [--spin [--sky-speed 0.05]]  (animation: the sun stays beside the camera = the planet turns
-//                                          under it; the starfield turns at sky-speed x the planet)
+//                                          under it; the starfield turns at sky-speed x the camera;
+//                                          without --spin only if --sky-speed is given)
 //            [--view leo --frames N [--km-per-frame 1]]      (LEO fly-along; clouds frozen)
 //            [--vibrance 1.3]                                (saturation boost before the palette)
 //   earthgen --planet NAME --describe   (physics "planet card" of a preset; no rendering)
@@ -40,6 +41,8 @@ double now_s() {
 }
 }  // namespace
 
+constexpr int LEO_GRID = 768;  // --view leo grid for non-plate worlds (~13 km Earth-equivalent cells)
+
 int main(int argc, char** argv) {
     std::string out = "earth.png", palette_path, earth_path, maps_dir, cloud_image;
     PlanetParams prm;
@@ -48,7 +51,7 @@ int main(int argc, char** argv) {
     float yaw_deg = 0.0f, sun_az = 0.0f;
     int n_frames = 0;
     float orbits = 1.0f, sky_speed = 0.05f, cloud_minutes = 20.0f, km_per_frame = 1.0f, vibrance = 1.3f;
-    bool spin = false, raw = false, plain_palette = false, leo = false, describe_only = false, physics_world = false;
+    bool grid_set = false, spin = false, sky_set = false, raw = false, plain_palette = false, leo = false, describe_only = false, physics_world = false;
     PhysicalInputs phys;
     std::string world_knobs;  // --world key=value,... (after the physics)
     LeoParams leo_prm;
@@ -60,7 +63,7 @@ int main(int argc, char** argv) {
         };
         if (a == "--out") out = next();
         else if (a == "--seed") prm.seed = static_cast<uint32_t>(std::strtoul(next(), nullptr, 10));
-        else if (a == "--grid") prm.grid_n = std::atoi(next());
+        else if (a == "--grid") { prm.grid_n = std::atoi(next()); grid_set = true; }
         else if (a == "--earth") earth_path = next();
         else if (a == "--cloud-image") cloud_image = next();
         else if (a == "--maps") maps_dir = next();
@@ -72,7 +75,7 @@ int main(int argc, char** argv) {
         else if (a == "--km-per-frame") km_per_frame = static_cast<float>(std::atof(next()));
         else if (a == "--vibrance") vibrance = static_cast<float>(std::atof(next()));
         else if (a == "--spin") spin = true;
-        else if (a == "--sky-speed") sky_speed = static_cast<float>(std::atof(next()));
+        else if (a == "--sky-speed") { sky_speed = static_cast<float>(std::atof(next())); sky_set = true; }
         else if (a == "--orbits") orbits = static_cast<float>(std::atof(next()));
         else if (a == "--cloud-minutes") cloud_minutes = std::max(0.0f, static_cast<float>(std::atof(next())));
         else if (a == "--sun-elev") leo_prm.sun_elev_deg = static_cast<float>(std::atof(next()));
@@ -139,6 +142,14 @@ int main(int argc, char** argv) {
                      prm.cloud_amount, planet.world.deck ? " (deck)" : "", planet.world.crater_density);
     }
     if (!world_knobs.empty() && !set_world_knobs(planet.world, world_knobs)) return 2;
+    if (leo && !grid_set && planet.world.style != TerrainStyle::Plates) {
+        // LEO pixels are ~1-3 km: non-plate worlds get their close-up detail from a
+        // finer grid (smaller craters, scarps...) instead of Earth's sub-grid relief.
+        prm.grid_n = LEO_GRID;
+        WorldSpec w = planet.world;
+        planet = Planet(prm.grid_n);
+        planet.world = w;
+    }
     if (!earth_path.empty()) {
         if (!load_earth_terrain(planet, earth_path)) {
             std::fprintf(stderr, "could not read %s\n", earth_path.c_str());
@@ -274,7 +285,7 @@ int main(int argc, char** argv) {
             if (weather && cloud_minutes > 0.0f) advance_clouds(*weather, planet, f == 0 ? 0.0f : cloud_minutes);
             float yaw = yaw_deg + 360.0f * orbits * f / n_frames;
             View fv = disk_view(W, yaw, spin ? sun_az : sun_az - (yaw - yaw_deg));  // else sun fixed in space
-            if (spin) fv.sky_turn = (1.0f - sky_speed) * (yaw - yaw_deg) * 0.017453293f;
+            if (spin || sky_set) fv.sky_turn = (1.0f - sky_speed) * (yaw - yaw_deg) * 0.017453293f;
             frames.push_back(render_frame(fv));
         }
     }

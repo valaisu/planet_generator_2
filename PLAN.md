@@ -505,3 +505,19 @@ pool, a preference head, diversity) once there is data, and wants to understand 
       likely-disliked seeds before rendering, ridge on frozen DINO embeddings of the pixel art
       (CV 0.90) predicts the tier, greedy MMR (B or better eligible, diversity 0.65) (2026-11-08).
 - [ ] Open (user's call): re-weight the random sampler with the card model; tier the showcase.
+
+### Showcase media + low orbit on new worlds (2026-11-08)
+- [x] Spinning clips (`--spin`, `--sky-speed`; tools/spin.py: 10 most distinct showcase picks,
+      0.3 turns / 8 s, sky 0.067x; user-picked speeds) -> renders/spin/.
+- [x] LEO stills (tools/leo_showcase.py) + fly-along clips (renders/leo_anim/).
+- [x] LEO streaks on non-Earth worlds: cause = the Earth-tuned sub-grid detail (noise relief
+      scaled by |h|, normals x10; vegetation tint, lakes, rivers on every world). Now: noise
+      relief tilt only on plate worlds, vegetation tint only with biomes, lakes/rivers only
+      with an ocean; non-plate worlds render LEO on a 768 grid (real smaller craters, ~30 s).
+- [ ] Open: lifeless plate worlds (#20177) keep the Earth relief streaks; LEO target on
+      coastless worlds is a fixed point (lon 0; can be a featureless plain, #20097); dark
+      glow exposure on #20080.
+- [x] Tried + reverted (user, 2026-11-08: "the execution just was not good enough"): per-pixel
+      small craters below the grid (hashed lattices, same population as craters.cpp) and grid
+      craters at full depth on the LEO grid. Lower LEO sun (25 / 12 deg) didn't work either.
+- [ ] Open: LEO detail on non-plate worlds (still soft: grid-scale colour patches).

@@ -27,9 +27,8 @@ data/*.jpg
 *.gif
 *.mp4
 
-# planet pool for tools/rank.py: images regenerate from the seeds, judgments are kept
-pool*/*.png
-pool*/*.tmp
+# planet pools for tools/rank.py (images + judgments): kept local
+pool*/
 
 # DINOv2 training views (tools/views.py) and model outputs (tools/dino.py): regenerate from seeds
 views/
